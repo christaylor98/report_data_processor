@@ -1,0 +1,12 @@
+[Unit]
+Description=Run JSNL Processor every 10 minutes
+Requires=jsnl_processor.service
+
+[Timer]
+Unit=jsnl_processor.service
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target 
