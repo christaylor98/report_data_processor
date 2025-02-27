@@ -5,3 +5,5 @@ Cargo.lock
 env
 market_data_analysis/
 misc/
+log/
+__pycache__

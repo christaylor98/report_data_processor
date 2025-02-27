@@ -18,13 +18,15 @@ import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
 import traceback
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Set
+import time
 
 from dotenv import load_dotenv
 import mysql.connector
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pandas as pd
 
 load_dotenv()
 
@@ -80,100 +82,105 @@ for dir_path in [CONFIG['input_dir'], CONFIG['processed_dir'], CONFIG['output_di
 
 
 class DatabaseHandler:
-    """Handles all database operations for the processor."""
+    """Handles database operations for JSNL data."""
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.conn = None
+        self.cursor = None
         
     def connect(self) -> None:
-        """Connect to the MariaDB database."""
+        """Connect to the database."""
         try:
-            self.conn = mysql.connector.connect(**self.config)
-            logger.info("Connected to MariaDB database")
-        except mysql.connector.Error as err:
-            logger.error(f"Failed to connect to database: {err}")
+            self.conn = mysql.connector.connect(
+                host=self.config['host'],
+                port=self.config['port'],
+                user=self.config['user'],
+                password=self.config['password'],
+                database=self.config['database']
+            )
+            self.cursor = self.conn.cursor()
+            logger.info(f"Connected to database {self.config['database']} on {self.config['host']}")
+        except Exception as e:
+            logger.error(f"Failed to connect to database: {str(e)}")
             raise
             
     def disconnect(self) -> None:
-        """Close the database connection."""
-        if self.conn and self.conn.is_connected():
+        """Disconnect from the database."""
+        if self.cursor:
+            self.cursor.close()
+        if self.conn:
             self.conn.close()
-            logger.info("Disconnected from MariaDB database")
+            logger.info("Disconnected from database")
             
-    def store_equity(self, log_id: str, timestamp: float, mode: str, equity: float) -> None:
-        """Store equity data in the database idempotently."""
-        if not self.conn or not self.conn.is_connected():
-            self.connect()
-            
-        try:
-            cursor = self.conn.cursor()
-            
-            # First check if record exists and is identical
-            check_query = """
-                SELECT equity FROM dashboard_equity 
-                WHERE id = %s AND timestamp = %s AND mode = %s
-            """
-            cursor.execute(check_query, (log_id, timestamp, mode))
-            result = cursor.fetchone()
-            
-            if result and abs(result[0] - equity) < 1e-10:  # Compare floats with tolerance
-                logger.debug(f"Identical equity record exists for {log_id}, skipping")
-                cursor.close()
-                return
-                
-            # Insert or update if different
-            query = """
-                INSERT INTO dashboard_equity (id, timestamp, mode, equity) 
-                VALUES (%s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE 
-                    equity = IF(ABS(equity - VALUES(equity)) >= 1e-10, VALUES(equity), equity)
-            """
-            cursor.execute(query, (log_id, timestamp, mode, equity))
-            self.conn.commit()
-            cursor.close()
-            
-        except mysql.connector.Error as err:
-            logger.error(f"Failed to store equity data: {err}")
-            self.conn.rollback()
-            raise
-            
-    def store_data(self, log_id: str, timestamp: float, mode: str, data_json: str) -> None:
-        """Store trade data in the database idempotently."""
-        if not self.conn or not self.conn.is_connected():
-            self.connect()
+    def store_equity(self, data: Dict[str, Any]) -> None:
+        """Store equity data in the database."""
+        if not self.conn or not self.cursor:
+            logger.error("Database connection not established")
+            return
             
         try:
-            cursor = self.conn.cursor()
-            
-            # First check if record exists and is identical
-            check_query = """
-                SELECT data_json FROM dashboard_data 
-                WHERE id = %s AND timestamp = %s AND mode = %s
-            """
-            cursor.execute(check_query, (log_id, timestamp, mode))
-            result = cursor.fetchone()
-            
-            if result and result[0] == data_json:
-                logger.debug(f"Identical trade record exists for {log_id}, skipping")
-                cursor.close()
-                return
-                
-            # Insert or update if different
+            # Insert or replace equity record
             query = """
-                INSERT INTO dashboard_data (id, timestamp, mode, data_json) 
-                VALUES (%s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE 
-                    data_json = IF(data_json != VALUES(data_json), VALUES(data_json), data_json)
+            REPLACE INTO trading.dashboard_equity 
+            (id, timestamp, mode, equity) 
+            VALUES (%s, %s, %s, %s)
             """
-            cursor.execute(query, (log_id, timestamp, mode, data_json))
-            self.conn.commit()
-            cursor.close()
             
-        except mysql.connector.Error as err:
-            logger.error(f"Failed to store trade data: {err}")
+            self.cursor.execute(
+                query, 
+                (
+                    data['log_id'],  # Use log_id as id
+                    data['timestamp'],
+                    data.get('mode', 'live'),  # Default to 'live' if mode not provided
+                    data['equity']
+                )
+            )
+            self.conn.commit()
+            logger.debug(f"Stored equity data for {data['log_id']} at {data['timestamp']}")
+        except Exception as e:
+            logger.error(f"Failed to store equity data: {str(e)}")
             self.conn.rollback()
-            raise
+            
+    def store_trade(self, data: Dict[str, Any]) -> None:
+        """Store trade data in the database."""
+        if not self.conn or not self.cursor:
+            logger.error("Database connection not established")
+            return
+            
+        try:
+            # Use log_id directly as the ID
+            trade_id = data['log_id']
+            
+            # Create JSON data for the trade
+            json_data = json.dumps({
+                'instrument': data['instrument'],
+                'price': data['price'],
+                'profit': data['profit']
+            })
+            
+            # Insert or replace trade record in trading.dashboard_data table
+            query = """
+            REPLACE INTO trading.dashboard_data 
+            (timestamp, id, mode, data_type, json_data) 
+            VALUES (%s, %s, %s, %s, %s)
+            """
+            
+            self.cursor.execute(
+                query, 
+                (
+                    data['timestamp'],
+                    trade_id,
+                    data.get('mode', 'live'),  # Default to 'live' if mode not provided
+                    data['trade_type'],  # Use trade_type as data_type
+                    json_data
+                )
+            )
+            self.conn.commit()
+            logger.debug(f"Stored trade data for {trade_id} at {data['timestamp']}")
+        except Exception as e:
+            logger.error(f"Failed to store trade data: {str(e)}")
+            self.conn.rollback()
 
 
 class JSNLProcessor:
@@ -223,12 +230,14 @@ class JSNLProcessor:
             
         logger.info(f"Found {len(jsnl_files)} JSNL files to process")
         generated_files = []
+        data_timestamps = set()  # Track timestamps from the data
         
         for jsnl_file in jsnl_files:
             try:
-                output_file = self.process_single_file(jsnl_file)
+                output_file, timestamps = self.process_single_file(jsnl_file)
                 if output_file:
                     generated_files.append(output_file)
+                    data_timestamps.update(timestamps)
                     
                 # Move processed file
                 processed_path = os.path.join(self.config['processed_dir'], os.path.basename(jsnl_file))
@@ -239,167 +248,378 @@ class JSNLProcessor:
                 logger.error(f"Error processing file {jsnl_file}: {str(e)}")
                 logger.error(traceback.format_exc())
                 
+        # Perform merges based on data timestamps
+        if data_timestamps:
+            min_ts = min(data_timestamps)
+            max_ts = max(data_timestamps)
+            logger.info(f"Data timestamps range from {datetime.fromtimestamp(min_ts)} to {datetime.fromtimestamp(max_ts)}")
+            
+            # Merge files for each hour in the data range
+            self.merge_parquet_files('hourly', min_ts, max_ts)
+            
+            # Merge files for each day in the data range
+            self.merge_parquet_files('daily', min_ts, max_ts)
+            
+            # Merge files for each month in the data range
+            self.merge_parquet_files('monthly', min_ts, max_ts)
+        
         return generated_files
     
-    def process_single_file(self, jsnl_file: str) -> Optional[str]:
+    def process_single_file(self, jsnl_file: str) -> Tuple[Optional[str], Set[float]]:
         """
         Process a single JSNL file into Parquet format.
-        Returns the path to the generated Parquet file.
+        Returns the path to the generated Parquet file and set of timestamps.
         """
         file_id = self.get_file_id(jsnl_file)
-        output_file = os.path.join(
-            self.config['temp_dir'],
-            self.get_output_filename(jsnl_file, file_id)
-        )
+        output_filename = self.get_output_filename(jsnl_file, file_id)
         
-        # Skip if file already exists
+        # Check if file already exists (idempotent processing)
+        output_file = os.path.join(self.config['temp_dir'], output_filename)
         if os.path.exists(output_file):
             logger.info(f"File {output_file} already exists, skipping processing")
-            return output_file
-            
-        # Data containers
-        records = []
+            return output_file, set()
         
         logger.info(f"Processing file {jsnl_file}")
         
-        try:
-            with open(jsnl_file, 'r', encoding='utf-8') as f:
-                line_count = 0
-                for line in f:
-                    line_count += 1
-                    try:
-                        data = json.loads(line)
-                        
-                        # Extract required fields
-                        log_id = data.get('id', '')
-                        timestamp = data.get('timestamp', 0.0)
-                        value = data.get('value', [])
-                        mode = data.get('mode', 'real-time')
-                        
-                        # Process record for Parquet
-                        records.append({
-                            'log_id': log_id,
-                            'timestamp': timestamp,
-                            'data': json.dumps(data)  # Store full data as JSON string
-                        })
-                        
-                        # Check for equity data
-                        for item in value:
-                            if isinstance(item, dict) and item.get('t') == 'e' and 'equity' in item:
-                                equity = float(item.get('equity', 0.0))
-                                self.db_handler.store_equity(log_id, timestamp, mode, equity)
-                            
-                            # Check for trade events
-                            if isinstance(item, dict) and item.get('t') in ['open', 'close', 'adjust-open']:
-                                self.db_handler.store_data(log_id, timestamp, mode, json.dumps(item))
-                    
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid JSON on line {line_count} in {jsnl_file}")
-                    except Exception as e:
-                        logger.error(f"Error processing line {line_count} in {jsnl_file}: {str(e)}")
-            
-            # Create Parquet file if we have records
-            if records:
-                self.save_to_parquet(records, output_file)
-                logger.info(f"Created Parquet file: {output_file}")
-                return output_file
-            else:
-                logger.warning(f"No valid records found in {jsnl_file}")
-                return None
+        # Initialize counters for statistics
+        total_records = 0
+        invalid_records = 0
+        missing_fields = 0
+        processed_records = 0
+        
+        # Initialize data structures for records
+        records = []
+        timestamps = set()
+        
+        # Process each line in the file
+        with open(jsnl_file, 'r', encoding='utf-8') as f:
+            for _line_num, line in enumerate(f, 1):
+                total_records += 1
                 
-        except Exception as e:
-            logger.error(f"Failed to process file {jsnl_file}: {str(e)}")
-            logger.error(traceback.format_exc())
-            return None
-    
-    def save_to_parquet(self, records: List[Dict[str, Any]], output_file: str) -> None:
-        """Save records to a Parquet file using DuckDB."""
-        if not self.conn:
-            self.init_duckdb()
-            
-        try:
-            # Convert records to Arrow table
-            df = pa.Table.from_pylist(records)
-            
-            # Write to Parquet file
-            pq.write_table(df, output_file, compression='snappy')
-            
-        except Exception as e:
-            logger.error(f"Failed to save Parquet file: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
-    
-    def merge_parquet_files(self, time_interval: str) -> None:
-        """
-        Merge Parquet files based on the specified time interval.
-        Intervals: 'hourly', 'daily', 'monthly'
-        """
-        if time_interval not in self.config['merge_intervals']:
-            logger.error(f"Invalid merge interval: {time_interval}")
-            return
-            
-        # Calculate the time threshold
-        minutes = self.config['merge_intervals'][time_interval]
-        threshold = datetime.now() - timedelta(minutes=minutes)
+                try:
+                    # Parse JSON
+                    record = json.loads(line)
+                    
+                    # Extract required fields
+                    log_id = record.get('log_id')
+                    timestamp = record.get('timestamp')
+                    value = record.get('value')
+                    
+                    # Skip records without required fields
+                    if not log_id or not timestamp or not value:
+                        missing_fields += 1
+                        continue
+                    
+                    # Skip records with empty log_id
+                    if not log_id.strip():
+                        missing_fields += 1
+                        continue
+                    
+                    # Add timestamp to set
+                    timestamps.add(timestamp)
+                    
+                    # Add filename to record for traceability
+                    record_data = {
+                        'log_id': log_id,
+                        'timestamp': timestamp,
+                        'filename': os.path.basename(jsnl_file),
+                        'data': json.dumps(record)  # Store the entire record as JSON string
+                    }
+                    
+                    # Add to records for Parquet
+                    records.append(record_data)
+                    processed_records += 1
+                    
+                    # Process for database storage based on value type
+                    self.process_record_for_db(record)
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid JSON in file {jsnl_file}: {str(e)}")
+                    invalid_records += 1
+                except Exception as e:
+                    logger.error(f"Error processing line in {jsnl_file}: {str(e)}")
+                    invalid_records += 1
         
-        # Directory for the merged files
-        merged_dir = os.path.join(self.config['output_dir'], time_interval)
-        os.makedirs(merged_dir, exist_ok=True)
+        # Log processing statistics
+        logger.info(f"File processing statistics for {jsnl_file}:")
+        logger.info(f"  Total records: {total_records}")
+        logger.info(f"  Invalid records: {invalid_records}")
+        logger.info(f"  Missing required fields: {missing_fields}")
+        logger.info(f"  Successfully processed: {processed_records}")
         
-        # Generate deterministic merged filename based on time period
-        period_start = threshold.replace(minute=0, second=0, microsecond=0)
-        merged_file = os.path.join(
-            merged_dir, 
-            f"{time_interval}_{period_start.strftime('%Y%m%d_%H%M%S')}.parquet"
+        # If no valid records were found, return None
+        if not records:
+            logger.warning(f"No valid records found in {jsnl_file}, no Parquet file created")
+            return None, timestamps
+        
+        # Create Parquet file
+        # Add date column for partitioning
+        for record in records:
+            record['date'] = datetime.fromtimestamp(record['timestamp']).strftime('%Y-%m-%d')
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(records)
+        
+        # Create PyArrow table
+        table = pa.Table.from_pandas(df)
+        
+        # Write to Parquet with optimizations
+        pq.write_table(
+            table,
+            output_file,
+            compression='snappy',
+            use_dictionary=True,
+            write_statistics=True
         )
         
-        # Skip if merged file already exists
-        if os.path.exists(merged_file):
-            logger.info(f"Merged file {merged_file} already exists, skipping merge")
+        logger.info(f"Saved Parquet file with optimizations for time range and ID queries: {output_file}")
+        logger.info(f"Created Parquet file: {output_file} with {len(records)} records")
+        
+        return output_file, timestamps
+    
+    def process_record_for_db(self, record: Dict[str, Any]) -> None:
+        """
+        Process a record for database storage.
+        Extracts equity and trade data and stores in the appropriate database tables.
+        """
+        log_id = record.get('log_id')
+        timestamp = record.get('timestamp')
+        value = record.get('value')
+        
+        if not log_id or not timestamp or not value:
             return
         
-        # Find files to merge
+        # Process based on value type
+        if isinstance(value, dict):
+            # Single value object
+            self.process_value_object(log_id, timestamp, value)
+        elif isinstance(value, list):
+            # Multiple value objects
+            for value_obj in value:
+                if isinstance(value_obj, dict):
+                    self.process_value_object(log_id, timestamp, value_obj)
+
+    def process_value_object(self, log_id: str, timestamp: float, value_obj: Dict[str, Any]) -> None:
+        """Process a single value object for database storage."""
+        record_type = value_obj.get('t')
+        
+        if record_type == 'e':  # Equity record
+            # Extract equity data
+            equity_data = {
+                'log_id': log_id,
+                'timestamp': timestamp,
+                'broker': value_obj.get('b', ''),
+                'equity': value_obj.get('equity', 0.0)
+            }
+            
+            # Store in database
+            self.db_handler.store_equity(equity_data)
+            
+        elif record_type in ['open', 'close', 'adjust-open', 'adjust-close']:  # Trade record
+            # Extract trade data
+            trade_data = {
+                'log_id': log_id,
+                'timestamp': timestamp,
+                'trade_type': record_type,
+                'instrument': value_obj.get('instrument', ''),
+                'price': value_obj.get('price', 0.0),
+                'profit': value_obj.get('profit', 0.0)
+            }
+            
+            # Store in database
+            self.db_handler.store_trade(trade_data)
+    
+    def create_equity_parquet(self, records: List[Dict[str, Any]], output_file: str) -> None:
+        """Create a Parquet file from equity records."""
+        # Add date column for partitioning
+        for record in records:
+            record['date'] = datetime.fromtimestamp(record['timestamp']).strftime('%Y-%m-%d')
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(records)
+        
+        # Create PyArrow table
+        table = pa.Table.from_pandas(df)
+        
+        # Write to Parquet with optimizations
+        pq.write_table(
+            table,
+            output_file,
+            compression='snappy',
+            use_dictionary=True,
+            write_statistics=True
+        )
+        
+        logger.info(f"Saved Parquet file with optimizations for time range and ID queries: {output_file}")
+
+    def create_trade_parquet(self, records: List[Dict[str, Any]], output_file: str) -> None:
+        """Create a Parquet file from trade records."""
+        # Add date column for partitioning
+        for record in records:
+            record['date'] = datetime.fromtimestamp(record['timestamp']).strftime('%Y-%m-%d')
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(records)
+        
+        # Create PyArrow table
+        table = pa.Table.from_pandas(df)
+        
+        # Write to Parquet with optimizations
+        pq.write_table(
+            table,
+            output_file,
+            compression='snappy',
+            use_dictionary=True,
+            write_statistics=True
+        )
+        
+        logger.info(f"Saved Parquet file with optimizations for trade data: {output_file}")
+    
+    def merge_parquet_files(self, time_interval: str, min_ts: float, max_ts: float) -> None:
+        """
+        Merge Parquet files based on the specified time interval and timestamp range.
+        Intervals: 'hourly', 'daily', 'monthly'
+        """
+        # Get the appropriate output directory based on the interval
+        if time_interval == 'hourly':
+            output_dir = os.path.join(self.config['output_dir'], 'hourly')
+        elif time_interval == 'daily':
+            output_dir = os.path.join(self.config['output_dir'], 'daily')
+        elif time_interval == 'monthly':
+            output_dir = os.path.join(self.config['output_dir'], 'monthly')
+        else:
+            logger.error(f"Invalid time interval: {time_interval}")
+            return
+        
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Find all Parquet files in the temp directory
         temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
         
-        # Filter files based on modification time
-        files_to_merge = []
-        for file_path in temp_files:
-            mod_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-            if mod_time >= threshold:
-                files_to_merge.append(file_path)
-        
-        if not files_to_merge:
+        if not temp_files:
             logger.info(f"No files found to merge for {time_interval} interval")
             return
-            
-        logger.info(f"Merging {len(files_to_merge)} files for {time_interval} interval")
         
-        try:
-            if not self.conn:
-                self.init_duckdb()
-                
-            # Create a table with all the data
-            self.conn.execute(f"CREATE TABLE merged AS SELECT * FROM parquet_scan({files_to_merge})")
-            
-            # Write to a new Parquet file
-            self.conn.execute(f"COPY merged TO '{merged_file}' (FORMAT PARQUET)")
-            
-            # Clean up
-            self.conn.execute("DROP TABLE merged")
-            
-            logger.info(f"Successfully created merged file: {merged_file}")
-            
-            # If it's a monthly merge, we can delete the original files
+        # Track which files were successfully processed
+        processed_temp_files = set()
+        
+        # Convert timestamps to datetime for interval calculations
+        start_dt = datetime.fromtimestamp(min_ts)
+        end_dt = datetime.fromtimestamp(max_ts)
+        
+        # Initialize delta for all cases
+        delta = timedelta(hours=1)  # Default value
+        
+        if time_interval == 'hourly':
+            # For hourly, round to the start of the hour
+            start_dt = start_dt.replace(minute=0, second=0, microsecond=0)
+            delta = timedelta(hours=1)
+        elif time_interval == 'daily':
+            # For daily, round to the start of the day
+            start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            delta = timedelta(days=1)
+        elif time_interval == 'monthly':
+            # For monthly, round to the start of the month
+            start_dt = start_dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            # For monthly, we'll use the delta in the next_dt calculation
+        
+        current_dt = start_dt
+        
+        # Process each time period
+        while current_dt <= end_dt:
+            # Calculate the next period
             if time_interval == 'monthly':
-                for file_path in files_to_merge:
-                    try:
-                        os.remove(file_path)
-                        logger.info(f"Deleted merged file: {file_path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete file {file_path}: {str(e)}")
+                next_dt = (current_dt.replace(day=1) + timedelta(days=32)).replace(day=1)
+            else:
+                next_dt = current_dt + delta
             
+            # Format the period for the output filename
+            period_str = current_dt.strftime('%Y%m%d_%H%M%S')
+            
+            try:
+                # Create the output filename
+                output_file = os.path.join(output_dir, f"{time_interval}_{period_str}.parquet")
+                
+                # Check if the file already exists (idempotent)
+                if os.path.exists(output_file):
+                    logger.info(f"Merged file already exists: {output_file}, skipping")
+                else:
+                    # Create a temporary table for the merged data
+                    self.conn.execute(f"""
+                        CREATE OR REPLACE TABLE merged AS
+                        SELECT * FROM parquet_scan('{os.path.join(self.config['temp_dir'], '*.parquet')}')
+                        WHERE timestamp >= '{current_dt.timestamp()}'
+                        AND timestamp < '{next_dt.timestamp()}'
+                        ORDER BY timestamp, log_id
+                    """)
+                    
+                    # Write the merged data to a Parquet file
+                    self.conn.execute(f"""
+                        COPY merged TO '{output_file}' (FORMAT 'parquet')
+                    """)
+                    
+                    logger.info(f"Created merged file for period {current_dt} to {next_dt}: {output_file}")
+                
+                # Mark these files as processed
+                for file in temp_files:
+                    processed_temp_files.add(file)
+                
+            except Exception as e:
+                logger.error(f"Failed to merge {time_interval} files for period {current_dt}: {str(e)}")
+                logger.error(traceback.format_exc())
+            
+            current_dt = next_dt
+        
+        # After all merges complete, clean up temp files that were successfully merged
+        self.cleanup_temp_files(processed_temp_files)
+    
+    def cleanup_temp_files(self, processed_files: Set[str]) -> None:
+        """
+        Clean up temporary Parquet files that have been successfully merged.
+        
+        Args:
+            processed_files: Set of file paths that were successfully merged
+        """
+        try:
+            temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
+            
+            for temp_file in temp_files:
+                if temp_file in processed_files:
+                    try:
+                        os.remove(temp_file)
+                        logger.info(f"Removed processed temp file: {temp_file}")
+                    except OSError as e:
+                        logger.error(f"Failed to remove temp file {temp_file}: {str(e)}")
+                else:
+                    logger.debug(f"Keeping unprocessed temp file: {temp_file}")
+                
         except Exception as e:
-            logger.error(f"Failed to merge {time_interval} files: {str(e)}")
+            logger.error(f"Error during temp file cleanup: {str(e)}")
+            logger.error(traceback.format_exc())
+    
+    def cleanup_old_temp_files(self, max_age_days: int = 7) -> None:
+        """
+        Clean up any temporary files older than the specified number of days.
+        
+        Args:
+            max_age_days: Maximum age of temp files in days
+        """
+        try:
+            temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
+            cutoff_time = time.time() - (max_age_days * 24 * 60 * 60)
+            
+            for temp_file in temp_files:
+                try:
+                    file_mtime = os.path.getmtime(temp_file)
+                    if file_mtime < cutoff_time:
+                        os.remove(temp_file)
+                        logger.warning(f"Removed old temp file: {temp_file} (age: {(time.time() - file_mtime) / 86400:.1f} days)")
+                except OSError as e:
+                    logger.error(f"Failed to process old temp file {temp_file}: {str(e)}")
+                
+        except Exception as e:
+            logger.error(f"Error during old temp file cleanup: {str(e)}")
             logger.error(traceback.format_exc())
     
     def run(self) -> None:
@@ -418,18 +638,21 @@ class JSNLProcessor:
             # Hourly merge (every hour)
             if current_time.minute < self.config['processing_interval_minutes']:
                 logger.info("Performing hourly merge")
-                self.merge_parquet_files('hourly')
+                self.merge_parquet_files('hourly', current_time.timestamp(), current_time.timestamp())
                 
             # Daily merge (at midnight)
             if current_time.hour == 0 and current_time.minute < self.config['processing_interval_minutes']:
                 logger.info("Performing daily merge")
-                self.merge_parquet_files('daily')
+                self.merge_parquet_files('daily', current_time.timestamp(), current_time.timestamp())
                 
             # Monthly merge (on the 1st of each month)
             if current_time.day == 1 and current_time.hour == 0 and current_time.minute < self.config['processing_interval_minutes']:
                 logger.info("Performing monthly merge")
-                self.merge_parquet_files('monthly')
+                self.merge_parquet_files('monthly', current_time.timestamp(), current_time.timestamp())
                 
+            # Clean up old temp files
+            self.cleanup_old_temp_files()
+            
         except Exception as e:
             logger.error(f"Error running JSNL processor: {str(e)}")
             logger.error(traceback.format_exc())
@@ -489,17 +712,17 @@ def main():
                 # Hourly merge (every hour)
                 if current_time.minute < processor.config['processing_interval_minutes']:
                     logger.info("Performing hourly merge")
-                    processor.merge_parquet_files('hourly')
+                    processor.merge_parquet_files('hourly', current_time.timestamp(), current_time.timestamp())
                     
                 # Daily merge (at midnight)
                 if current_time.hour == 0 and current_time.minute < processor.config['processing_interval_minutes']:
                     logger.info("Performing daily merge")
-                    processor.merge_parquet_files('daily')
+                    processor.merge_parquet_files('daily', current_time.timestamp(), current_time.timestamp())
                     
                 # Monthly merge (on the 1st of each month)
                 if current_time.day == 1 and current_time.hour == 0 and current_time.minute < processor.config['processing_interval_minutes']:
                     logger.info("Performing monthly merge")
-                    processor.merge_parquet_files('monthly')
+                    processor.merge_parquet_files('monthly', current_time.timestamp(), current_time.timestamp())
             else:
                 logger.info("Skipping merge step as requested")
                 

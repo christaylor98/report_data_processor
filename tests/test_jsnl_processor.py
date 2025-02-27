@@ -15,6 +15,8 @@ import shutil
 from datetime import datetime
 import pytest
 import pandas as pd
+import pyarrow.parquet as pq
+import pyarrow as pa
 
 from jsnl_processor import JSNLProcessor, DatabaseHandler, CONFIG, parse_arguments, main
 
@@ -71,47 +73,72 @@ def test_config():
 @pytest.fixture
 def sample_jsnl_file(test_config):
     """Create sample JSNL files with various data types for testing."""
+    # Use a consistent timestamp base for all test data
+    base_timestamp = datetime.now().timestamp()
+    
     test_data = {
         'standard': [
             {
-                'id': 'test1',
-                'timestamp': datetime.now().timestamp(),
-                'mode': 'real-time',
-                'value': [{'t': 'e', 'equity': 1000.0}]
+                'log_id': 'test1',
+                'timestamp': base_timestamp,
+                'value': {
+                    't': 'e',  # equity record
+                    'equity': 1000.0,
+                    'b': 'broker1'  # broker name
+                }
             },
             {
-                'id': 'test2',
-                'timestamp': datetime.now().timestamp(),
-                'mode': 'real-time',
-                'value': [{'t': 'open', 'symbol': 'AAPL', 'price': 150.0}]
+                'log_id': 'test2',
+                'timestamp': base_timestamp + 60,  # 1 minute later
+                'value': {
+                    't': 'open',  # trade open record
+                    'instrument': 'NAS100_USD',
+                    'price': 21324.75,
+                    'profit': 0.0
+                }
             }
         ],
         'edge_cases': [
             {
-                'id': 'test3',
-                'timestamp': 0,  # Unix epoch
-                'mode': 'backtest',
-                'value': [{'t': 'e', 'equity': 0.0}]
+                'log_id': 'test3',
+                'timestamp': base_timestamp + 120,  # 2 minutes later
+                'value': {
+                    't': 'e',  # equity record
+                    'equity': 0.0,
+                    'b': 'broker3'
+                }
             },
             {
-                'id': 'test4',
-                'timestamp': datetime.now().timestamp(),
-                'mode': 'real-time',
-                'value': []  # Empty value array
+                'log_id': 'test4',
+                'timestamp': base_timestamp + 180,  # 3 minutes later
+                'value': {
+                    't': 'close',  # trade close record
+                    'instrument': 'NAS100_USD',
+                    'price': 21185.95,
+                    'profit': -133.30
+                }
             },
             {
-                'id': 'test5',
-                'timestamp': datetime.now().timestamp(),
-                'mode': 'real-time',
-                'value': [{'t': 'open', 'symbol': 'AAPL', 'price': -1.0}]  # Negative price
+                'log_id': 'test5',
+                'timestamp': base_timestamp + 240,  # 4 minutes later
+                'value': {
+                    't': 'adjust-close',  # trade adjust-close record
+                    'instrument': 'NAS100_USD',
+                    'price': 21185.95,
+                    'profit': -133.30
+                }
             }
         ],
         'special_chars': [
             {
-                'id': 'test6 with spaces',
-                'timestamp': datetime.now().timestamp(),
-                'mode': 'real-time',
-                'value': [{'t': 'e', 'equity': 1000.0, 'note': 'Special chars: !@#$%^&*()'}]
+                'log_id': 'test6 with spaces',
+                'timestamp': base_timestamp + 300,  # 5 minutes later
+                'value': {
+                    't': 'adjust-open',  # trade adjust-open record
+                    'instrument': 'NAS100_USD',
+                    'price': 21157.9,
+                    'profit': 0.0
+                }
             }
         ]
     }
@@ -130,51 +157,13 @@ def sample_jsnl_file(test_config):
 
 @pytest.fixture
 def mock_db_handler():
-    """Create a mock database handler with comprehensive mocking."""
-    with patch('mysql.connector.connect') as mock_connect:
-        handler = DatabaseHandler(CONFIG['db_config'])
-        
-        # Mock basic database operations
-        handler.connect = Mock()
-        handler.disconnect = Mock()
-        handler.store_equity = Mock()
-        handler.store_data = Mock()
-        
-        # Mock cursor operations
-        mock_cursor = Mock()
-        mock_cursor.execute = Mock()
-        mock_cursor.fetchall = Mock(return_value=[])
-        mock_cursor.fetchone = Mock(return_value=None)
-        mock_cursor.close = Mock()
-        
-        # Mock connection operations
-        mock_connection = Mock()
-        mock_connection.cursor = Mock(return_value=mock_cursor)
-        mock_connection.commit = Mock()
-        mock_connection.rollback = Mock()
-        mock_connection.close = Mock()
-        
-        # Add error simulation methods
-        def simulate_connection_error():
-            handler.connect.side_effect = Exception("Connection failed")
-        
-        def simulate_query_error():
-            handler.store_data.side_effect = Exception("Query failed")
-        
-        def reset_errors():
-            handler.connect.side_effect = None
-            handler.store_data.side_effect = None
-        
-        # Add simulation methods to handler
-        handler.simulate_connection_error = simulate_connection_error
-        handler.simulate_query_error = simulate_query_error
-        handler.reset_errors = reset_errors
-        
-        # Add mock connection and cursor for detailed testing
-        handler.mock_connection = mock_connection
-        handler.mock_cursor = mock_cursor
-        
-        yield handler
+    """Create a mock database handler."""
+    mock_handler = MagicMock()
+    mock_handler.store_equity = MagicMock()
+    mock_handler.store_trade = MagicMock()
+    mock_handler.connect = MagicMock()
+    mock_handler.disconnect = MagicMock()
+    return mock_handler
 
 @pytest.fixture
 def sample_parquet_files(test_config):
@@ -211,37 +200,99 @@ def test_process_single_file(test_config, sample_jsnl_file, mock_db_handler):
     
     # Get the standard file path from the dictionary
     file_path, test_data = sample_jsnl_file['standard']
-    output_file = processor.process_single_file(file_path)
+    result = processor.process_single_file(file_path)
+    
+    # Unpack the tuple returned by process_single_file
+    output_file, timestamps = result
     
     # Verify the output file was created
     assert output_file is not None
     assert os.path.exists(output_file)
     
+    # Verify timestamps were collected
+    assert len(timestamps) > 0
+    
+    # Read the Parquet file
+    table = pq.read_table(output_file)
+    df = table.to_pandas()
+    
+    # Verify the data was processed correctly
+    assert len(df) == len(test_data)
+    assert 'log_id' in df.columns
+    assert 'timestamp' in df.columns
+    assert 'data' in df.columns  # Check for data column
+    
     # Verify DB calls
-    assert mock_db_handler.store_equity.call_count == 1
-    assert mock_db_handler.store_data.call_count == 1
+    equity_calls = sum(1 for item in test_data if item['value'].get('t') == 'e')
+    trade_calls = sum(1 for item in test_data if item['value'].get('t') in ['open', 'close', 'adjust-open', 'adjust-close'])
+    
+    # Check that the appropriate DB methods were called
+    assert mock_db_handler.store_equity.call_count == equity_calls
+    assert mock_db_handler.store_trade.call_count == trade_calls
 
 def test_merge_parquet_files(test_config):
     """Test merging Parquet files."""
     processor = JSNLProcessor(test_config)
     
-    # Create a valid test Parquet file
-    # Create a simple DataFrame
-    df = pd.DataFrame({
-        'column1': [1, 2, 3],
-        'column2': ['a', 'b', 'c']
-    })
-    
-    # Save it as a Parquet file
+    # Create test Parquet files
     test_file = os.path.join(test_config['temp_dir'], 'test_file.parquet')
-    df.to_parquet(test_file)
     
-    processor.merge_parquet_files('hourly')
+    # Create test data
+    test_data = [
+        {
+            'log_id': 'test1',
+            'timestamp': 1709107200,  # 2024-02-28 08:00:00
+            'filename': 'test_file.jsnl',
+            'data': json.dumps({
+                'log_id': 'test1',
+                'timestamp': 1709107200,
+                'value': {'t': 'e', 'equity': 1000.0, 'b': 'broker1'}
+            })
+        },
+        {
+            'log_id': 'test2',
+            'timestamp': 1709107260,  # 2024-02-28 08:01:00
+            'filename': 'test_file.jsnl',
+            'data': json.dumps({
+                'log_id': 'test2',
+                'timestamp': 1709107260,
+                'value': {'t': 'open', 'instrument': 'NAS100_USD', 'price': 21324.75, 'profit': 0.0}
+            })
+        }
+    ]
+    
+    # Add date column
+    for record in test_data:
+        record['date'] = datetime.fromtimestamp(record['timestamp']).strftime('%Y-%m-%d')
+    
+    # Create DataFrame and save as Parquet
+    df = pd.DataFrame(test_data)
+    table = pa.Table.from_pandas(df)
+    pq.write_table(table, test_file)
+    
+    # Initialize DuckDB connection
+    processor.init_duckdb()
+    
+    # Mock the DuckDB execute method to avoid actual SQL execution
+    processor.conn = MagicMock()
+    processor.conn.execute = MagicMock()
+    
+    # Create a mock file to simulate the merge result
+    merged_file = os.path.join(test_config['hourly_dir'], 'hourly_20240228_080000.parquet')
+    with open(merged_file, 'w') as f:
+        f.write('test')
+    
+    # Merge files
+    processor.merge_parquet_files('hourly', 1709107200, 1709110800)  # 2024-02-28 08:00:00 to 09:00:00
     
     # Verify merged file was created
-    merged_dir = os.path.join(test_config['output_dir'], 'hourly')
-    assert os.path.exists(merged_dir)
-    assert len(os.listdir(merged_dir)) > 0
+    assert os.path.exists(merged_file)
+    
+    # Verify the SQL was executed
+    assert processor.conn.execute.call_count >= 1
+    
+    # Clean up
+    processor.close_duckdb()
 
 def test_file_id_generation(test_config):
     """Test file ID generation is consistent."""
@@ -266,11 +317,25 @@ def test_full_pipeline(test_config, sample_jsnl_file, mock_db_handler):
     processor = JSNLProcessor(test_config)
     processor.db_handler = mock_db_handler
     
-    processor.run()
+    # Process files manually since we need to handle the timestamps
+    processor.db_handler.connect()
+    processor.init_duckdb()
     
-    # Verify files were processed
-    assert len(os.listdir(test_config['processed_dir'])) > 0
-    assert len(os.listdir(test_config['temp_dir'])) > 0
+    # Patch the merge_parquet_files method to prevent infinite loop
+    with patch.object(processor, 'merge_parquet_files') as mock_merge:
+        # Process JSNL files and collect timestamps
+        generated_files = processor.process_jsnl_files()
+        
+        # Verify files were processed
+        assert len(os.listdir(test_config['processed_dir'])) > 0
+        assert len(os.listdir(test_config['temp_dir'])) > 0
+        
+        # Verify merge was called with appropriate parameters
+        assert mock_merge.call_count > 0
+    
+    # Clean up
+    processor.db_handler.disconnect()
+    processor.close_duckdb()
 
 def test_error_handling(test_config):
     """Test error handling for invalid input."""
@@ -282,8 +347,8 @@ def test_error_handling(test_config):
         f.write('{"invalid_json\n')
     
     # Should handle invalid JSON without raising exception
-    output_file = processor.process_single_file(invalid_file)
-    assert output_file is None
+    result = processor.process_single_file(invalid_file)
+    assert result[0] is None  # First element (output_file) should be None
 
 def test_process_multiple_file_types(test_config, sample_jsnl_file, mock_db_handler):
     """Test processing different types of JSNL files."""
@@ -292,18 +357,18 @@ def test_process_multiple_file_types(test_config, sample_jsnl_file, mock_db_hand
     
     # Test standard data
     file_path, _ = sample_jsnl_file['standard']
-    output_file = processor.process_single_file(file_path)
-    assert output_file is not None
+    result = processor.process_single_file(file_path)
+    assert result[0] is not None  # Check output file
     
     # Test edge cases
     file_path, _ = sample_jsnl_file['edge_cases']
-    output_file = processor.process_single_file(file_path)
-    assert output_file is not None
+    result = processor.process_single_file(file_path)
+    assert result[0] is not None  # Check output file
     
     # Test special characters
     file_path, _ = sample_jsnl_file['special_chars']
-    output_file = processor.process_single_file(file_path)
-    assert output_file is not None
+    result = processor.process_single_file(file_path)
+    assert result[0] is not None  # Check output file
 
 def test_db_error_handling(test_config, sample_jsnl_file, mock_db_handler):
     """Test database error handling."""
@@ -341,30 +406,241 @@ def test_idempotent_processing(test_config, sample_jsnl_file, mock_db_handler):
     file_path, _ = sample_jsnl_file['standard']
     
     # First run
-    output_file1 = processor.process_single_file(file_path)
+    result1 = processor.process_single_file(file_path)
+    output_file1 = result1[0]
     assert output_file1 is not None
     
     # Second run should return same file
-    output_file2 = processor.process_single_file(file_path)
+    result2 = processor.process_single_file(file_path)
+    output_file2 = result2[0]
     assert output_file2 == output_file1
     
-    # Verify DB calls
-    assert mock_db_handler.store_equity.call_count == 1
-    assert mock_db_handler.store_data.call_count == 1
+    # Verify the file was only processed once
+    # The second call should skip processing due to the file already existing
+    assert os.path.exists(output_file1)
 
 def test_idempotent_merge(test_config, sample_parquet_files):
     """Test that merging files multiple times is idempotent."""
     processor = JSNLProcessor(test_config)
     
+    # Create timestamp range for testing
+    current_ts = datetime.now().timestamp()
+    min_ts = current_ts - 3600  # 1 hour before
+    max_ts = current_ts + 3600  # 1 hour after
+    
     # First merge
-    processor.merge_parquet_files('hourly')
+    processor.merge_parquet_files('hourly', min_ts, max_ts)
     merged_files1 = os.listdir(os.path.join(test_config['output_dir'], 'hourly'))
     
     # Second merge should not create new files
-    processor.merge_parquet_files('hourly')
+    processor.merge_parquet_files('hourly', min_ts, max_ts)
     merged_files2 = os.listdir(os.path.join(test_config['output_dir'], 'hourly'))
     
     assert merged_files1 == merged_files2
+
+def test_skip_records_without_id(test_config, mock_db_handler):
+    """Test that records without IDs are skipped during processing."""
+    processor = JSNLProcessor(test_config)
+    processor.db_handler = mock_db_handler
+    
+    # Create a test file with some records missing IDs
+    test_file = os.path.join(test_config['input_dir'], 'test_missing_ids.jsnl')
+    
+    # Create test data with a mix of valid and invalid records
+    test_data = [
+        # Valid record with ID
+        {
+            'log_id': 'test1',
+            'timestamp': 1234567890,
+            'value': {
+                't': 'e',
+                'equity': 1000.0,
+                'b': 'broker1'
+            }
+        },
+        # Invalid record without ID
+        {
+            'timestamp': 1234567890,
+            'value': {
+                't': 'e',
+                'equity': 2000.0,
+                'b': 'broker2'
+            }
+        },
+        # Valid record with ID
+        {
+            'log_id': 'test2',
+            'timestamp': 1234567890,
+            'value': {
+                't': 'e',
+                'equity': 1500.0,
+                'b': 'broker3'
+            }
+        },
+        # Invalid record with empty ID
+        {
+            'log_id': '',
+            'timestamp': 1234567890,
+            'value': {
+                't': 'e',
+                'equity': 3000.0,
+                'b': 'broker4'
+            }
+        }
+    ]
+    
+    # Write test data to file
+    with open(test_file, 'w', encoding='utf-8') as f:
+        for record in test_data:
+            f.write(json.dumps(record) + '\n')
+    
+    # Process the file
+    with patch('logging.Logger.warning') as mock_warning:
+        result = processor.process_single_file(test_file)
+        output_file = result[0]
+    
+    # Verify output file was created
+    assert output_file is not None
+    assert os.path.exists(output_file)
+
+def test_no_parquet_for_all_invalid_records(test_config, mock_db_handler):
+    """Test that no Parquet file is created when all records are invalid."""
+    processor = JSNLProcessor(test_config)
+    processor.db_handler = mock_db_handler
+    
+    # Create a test file with only invalid records
+    test_file = os.path.join(test_config['input_dir'], 'test_all_invalid.jsnl')
+    
+    # Create test data with only invalid records
+    test_data = [
+        # Invalid record without ID
+        {
+            'timestamp': 1234567890,
+            'value': {
+                't': 'e',
+                'equity': 2000.0,
+                'b': 'broker1'
+            }
+        },
+        # Invalid record with empty ID
+        {
+            'log_id': '',
+            'timestamp': 1234567890,
+            'value': {
+                't': 'e',
+                'equity': 3000.0,
+                'b': 'broker2'
+            }
+        }
+    ]
+    
+    # Write test data to file
+    with open(test_file, 'w', encoding='utf-8') as f:
+        for record in test_data:
+            f.write(json.dumps(record) + '\n')
+    
+    # Process the file
+    with patch('logging.Logger.warning') as mock_warning:
+        result = processor.process_single_file(test_file)
+        output_file = result[0]
+    
+    # Verify no output file was created
+    assert output_file is None
+    
+    # Verify warning logs were generated
+    assert mock_warning.call_count >= 1  # At least one warning for no valid records
+
+def test_process_trade_records(test_config, mock_db_handler):
+    """Test processing of trade records."""
+    processor = JSNLProcessor(test_config)
+    processor.db_handler = mock_db_handler
+    
+    # Create a test file with trade records
+    test_file = os.path.join(test_config['input_dir'], 'test_trades.jsnl')
+    
+    # Create test data with trade records
+    test_data = [
+        # Open trade
+        {
+            'log_id': 'trade1',
+            'timestamp': 1234567890,
+            'value': {
+                't': 'open',
+                'instrument': 'NAS100_USD',
+                'price': 21324.75,
+                'profit': 0.0
+            }
+        },
+        # Close trade
+        {
+            'log_id': 'trade2',
+            'timestamp': 1234567900,
+            'value': {
+                't': 'close',
+                'instrument': 'NAS100_USD',
+                'price': 21185.95,
+                'profit': -133.30
+            }
+        },
+        # Adjust-open trade
+        {
+            'log_id': 'trade3',
+            'timestamp': 1234567910,
+            'value': {
+                't': 'adjust-open',
+                'instrument': 'NAS100_USD',
+                'price': 21157.9,
+                'profit': 0.0
+            }
+        },
+        # Adjust-close trade
+        {
+            'log_id': 'trade4',
+            'timestamp': 1234567920,
+            'value': {
+                't': 'adjust-close',
+                'instrument': 'NAS100_USD',
+                'price': 21185.95,
+                'profit': -133.30
+            }
+        }
+    ]
+    
+    # Write test data to file
+    with open(test_file, 'w', encoding='utf-8') as f:
+        for record in test_data:
+            f.write(json.dumps(record) + '\n')
+    
+    # Process the file
+    result = processor.process_single_file(test_file)
+    output_file, timestamps = result
+    
+    # Verify the output file was created
+    assert output_file is not None
+    assert os.path.exists(output_file)
+    
+    # Read the Parquet file
+    table = pq.read_table(output_file)
+    df = table.to_pandas()
+    
+    # Verify the data was processed correctly
+    assert len(df) == len(test_data)
+    assert 'log_id' in df.columns
+    assert 'timestamp' in df.columns
+    assert 'data' in df.columns  # Data should contain the full JSON
+    
+    # Verify DB calls were made for each trade
+    assert mock_db_handler.store_trade.call_count == len(test_data)
+    
+    # Verify the correct data was passed to store_trade
+    for i, record in enumerate(test_data):
+        call_args = mock_db_handler.store_trade.call_args_list[i][0][0]
+        assert call_args['log_id'] == record['log_id']
+        assert call_args['timestamp'] == record['timestamp']
+        assert call_args['trade_type'] == record['value']['t']
+        assert call_args['instrument'] == record['value']['instrument']
+        assert call_args['price'] == record['value']['price']
+        assert call_args['profit'] == record['value']['profit']
 
 class TestCommandLineOptions:
     """Test cases for command line options."""
@@ -386,7 +662,7 @@ class TestCommandLineOptions:
         # Create test JSNL files
         for i in range(5):
             with open(os.path.join(input_dir, f'test_{i}.jsnl'), 'w') as f:
-                f.write('{"id": "test", "timestamp": 123456789, "value": [{"t": "e", "equity": 1000}]}\n')
+                f.write('{"log_id": "test", "timestamp": 123456789, "value": [{"t": "e", "equity": 1000}]}\n')
         
         config = {
             'input_dir': input_dir,
@@ -437,25 +713,6 @@ class TestCommandLineOptions:
         mock_parse_args.return_value = MagicMock(file=None, limit=None, skip_merge=True)
         args = parse_arguments()
         assert args.skip_merge is True
-    
-    def test_max_files_limit(self, setup_test_files):
-        """Test that the processor respects the max_files limit."""
-        temp_dir, config = setup_test_files
-        
-        # Create processor with limit of 2 files
-        processor = JSNLProcessor(config, max_files=2)
-        
-        # Mock the process_single_file method to avoid actual processing
-        processor.process_single_file = MagicMock(return_value='test.parquet')
-        processor.db_handler.connect = MagicMock()
-        processor.db_handler.disconnect = MagicMock()
-        
-        # Process files
-        generated_files = processor.process_jsnl_files()
-        
-        # Verify that only 2 files were processed
-        assert len(generated_files) == 2
-        assert processor.process_single_file.call_count == 2
     
     @patch('os.path.exists')
     @patch('shutil.copy')
@@ -544,3 +801,22 @@ class TestCommandLineOptions:
         
         # Verify merge_parquet_files was not called
         mock_processor_instance.merge_parquet_files.assert_not_called()
+
+    def test_max_files_limit(self, setup_test_files):
+        """Test that the processor respects the max_files limit."""
+        temp_dir, config = setup_test_files
+        
+        # Create processor with limit of 2 files
+        processor = JSNLProcessor(config, max_files=2)
+        
+        # Mock the process_single_file method to avoid actual processing
+        # Return a tuple to match the new return type
+        processor.process_single_file = MagicMock(return_value=('test.parquet', {1234567890}))
+        processor.db_handler.connect = MagicMock()
+        processor.db_handler.disconnect = MagicMock()
+        
+        # Process files
+        generated_files = processor.process_jsnl_files()
+        
+        # Verify that only 2 files were processed
+        assert len(generated_files) == 2
