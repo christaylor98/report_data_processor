@@ -1,12 +1,12 @@
+#pylint: disable=W1203, W0718, C0301, C0303
 """
 Market data analysis script for identifying gaps and consistent 5-second intervals in financial market data.
 Analyzes the rawprice table to find data gaps on weekdays and periods with consistent data sampling.
 """
-#pylint: disable=W1203, W0718, C0301, C0303
 import os
 from datetime import datetime, timedelta
 import argparse
-import pytz
+# import pytz
 
 import pandas as pd
 import mysql.connector
@@ -194,7 +194,7 @@ def analyze_time_gaps(df):
     print("Filtering out normal weekend gaps")
     weekday_gaps = []
     
-    for idx, row in gaps.iterrows():
+    for _idx, row in gaps.iterrows():
         gap_start = row['prev_datetime']
         gap_end = row['datetime']
         gap_days = row['gap_days']
@@ -592,6 +592,73 @@ def print_weekly_counts_by_instrument(df):
     weekly_stats.to_csv('weekly_counts_by_instrument.csv', index=False)
     print("\nWeekly counts saved to weekly_counts_by_instrument.csv")
 
+def analyze_weekly_5sec_data(df, tolerance=1.0):
+    """Analyze weekly distribution of data with consistent 5-second intervals by instrument"""
+    print("\n=== Weekly Breakdown of 5-Second Interval Data ===")
+    if df is None or df.empty:
+        print("No data available for analysis")
+        return
+    
+    # Calculate time differences
+    print("Calculating time differences between records")
+    df_sorted = df.sort_values(['instrument', 'datetime'])
+    df_sorted['time_diff'] = df_sorted.groupby('instrument')['datetime'].diff().dt.total_seconds()
+    df_sorted['time_diff'] = df_sorted['time_diff'].fillna(0)
+    
+    # Identify records with ~5 second intervals (using ±1 second tolerance)
+    print(f"Identifying records with 5 second intervals (±{tolerance}s)")
+    df_sorted['is_5sec'] = (df_sorted['time_diff'] >= 5 - tolerance) & (df_sorted['time_diff'] <= 5 + tolerance)
+    
+    # Keep only the 5-second interval records
+    five_sec_data = df_sorted[df_sorted['is_5sec']].copy()
+    print(f"Found {len(five_sec_data):,} records with ~5 second intervals")
+    
+    if five_sec_data.empty:
+        print("No 5-second interval data found")
+        return
+    
+    # Add week column
+    five_sec_data['year_week'] = five_sec_data['datetime'].dt.strftime('%Y-%U')
+    
+    # Group by instrument and week
+    weekly_5sec_stats = five_sec_data.groupby(['instrument', 'year_week']).agg(
+        record_count=('time', 'count'),
+        first_record=('datetime', 'min'),
+        last_record=('datetime', 'max'),
+        first_unix=('time', 'min'),
+        last_unix=('time', 'max')
+    ).reset_index()
+    
+    # Sort by instrument and week
+    weekly_5sec_stats = weekly_5sec_stats.sort_values(['instrument', 'year_week'])
+    
+    # Print 5-second data ranges for each instrument by week
+    for instrument, group in weekly_5sec_stats.groupby('instrument'):
+        print(f"\nInstrument: {instrument} - 5-Second Interval Data")
+        print("Week       | 5s Records | First Record           | Last Record            | Duration")
+        print("-----------+------------+------------------------+------------------------+------------")
+        
+        for _, row in group.iterrows():
+            first_date = row['first_record'].strftime('%Y-%m-%d %H:%M:%S')
+            last_date = row['last_record'].strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Calculate duration of 5s data in this week
+            duration = row['last_record'] - row['first_record']
+            hours = int(duration.total_seconds() // 3600)
+            minutes = int((duration.total_seconds() % 3600) // 60)
+            
+            duration_str = f"{hours}h {minutes}m"
+            
+            print(f"{row['year_week']} | {row['record_count']:10,} | {first_date} | {last_date} | {duration_str}")
+        
+        # Print total for this instrument
+        total = group['record_count'].sum()
+        print(f"Total      | {total:10,} |")
+    
+    # Save to CSV for reference
+    weekly_5sec_stats.to_csv('weekly_5sec_data.csv', index=False)
+    print("\nWeekly 5-second data statistics saved to weekly_5sec_data.csv")
+
 def main(sample_mode=False):
     print("=== Starting market data analysis ===")
     print(f"Running in {'sample mode' if sample_mode else 'full mode'}")
@@ -660,10 +727,14 @@ def main(sample_mode=False):
     
     # Analyze weekly distribution
     print("\n=== Analyzing Weekly Distribution ===")
-    pivot_table, summary = analyze_weekly_distribution(df)
+    _pivot_table, _summary = analyze_weekly_distribution(df)
     
     # Print weekly counts by instrument
     print_weekly_counts_by_instrument(df)
+    
+    # Analyze weekly 5-second data
+    print("\n=== Weekly Breakdown of 5-Second Interval Data ===")
+    analyze_weekly_5sec_data(df)
     
     print("\n=== Analysis complete. Results saved to the 'market_data_analysis' directory. ===")
 
