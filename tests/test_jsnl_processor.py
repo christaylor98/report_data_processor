@@ -3,17 +3,20 @@ JSNL to Parquet Processor - Test cases
 
 This module contains tests for the JSNLProcessor class.
 """
+# pylint: disable=W
+
 import os
 import json
 import tempfile
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, MagicMock, call
+import sys
+from pathlib import Path
 import shutil
 from datetime import datetime
 import pytest
 import pandas as pd
 
-from jsnl_processor import JSNLProcessor, DatabaseHandler, CONFIG
-
+from jsnl_processor import JSNLProcessor, DatabaseHandler, CONFIG, parse_arguments, main
 
 #pylint: disable=W1203, W0718, C0301, C0303
 
@@ -176,7 +179,6 @@ def mock_db_handler():
 @pytest.fixture
 def sample_parquet_files(test_config):
     """Create sample parquet files for testing merge operations."""
-    import pandas as pd
     
     file_paths = []
     
@@ -330,3 +332,215 @@ def test_db_error_handling(test_config, sample_jsnl_file, mock_db_handler):
         mock_process.return_value = None
         output_file = processor.process_single_file(file_path)
         assert output_file is None
+
+def test_idempotent_processing(test_config, sample_jsnl_file, mock_db_handler):
+    """Test that processing the same file multiple times is idempotent."""
+    processor = JSNLProcessor(test_config)
+    processor.db_handler = mock_db_handler
+    
+    file_path, _ = sample_jsnl_file['standard']
+    
+    # First run
+    output_file1 = processor.process_single_file(file_path)
+    assert output_file1 is not None
+    
+    # Second run should return same file
+    output_file2 = processor.process_single_file(file_path)
+    assert output_file2 == output_file1
+    
+    # Verify DB calls
+    assert mock_db_handler.store_equity.call_count == 1
+    assert mock_db_handler.store_data.call_count == 1
+
+def test_idempotent_merge(test_config, sample_parquet_files):
+    """Test that merging files multiple times is idempotent."""
+    processor = JSNLProcessor(test_config)
+    
+    # First merge
+    processor.merge_parquet_files('hourly')
+    merged_files1 = os.listdir(os.path.join(test_config['output_dir'], 'hourly'))
+    
+    # Second merge should not create new files
+    processor.merge_parquet_files('hourly')
+    merged_files2 = os.listdir(os.path.join(test_config['output_dir'], 'hourly'))
+    
+    assert merged_files1 == merged_files2
+
+class TestCommandLineOptions:
+    """Test cases for command line options."""
+    
+    @pytest.fixture
+    def setup_test_files(self):
+        """Create temporary test files."""
+        temp_dir = tempfile.mkdtemp()
+        input_dir = os.path.join(temp_dir, 'input')
+        processed_dir = os.path.join(temp_dir, 'processed')
+        output_dir = os.path.join(temp_dir, 'output')
+        temp_parquet_dir = os.path.join(output_dir, 'temp')
+        
+        os.makedirs(input_dir, exist_ok=True)
+        os.makedirs(processed_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(temp_parquet_dir, exist_ok=True)
+        
+        # Create test JSNL files
+        for i in range(5):
+            with open(os.path.join(input_dir, f'test_{i}.jsnl'), 'w') as f:
+                f.write('{"id": "test", "timestamp": 123456789, "value": [{"t": "e", "equity": 1000}]}\n')
+        
+        config = {
+            'input_dir': input_dir,
+            'processed_dir': processed_dir,
+            'output_dir': output_dir,
+            'temp_dir': temp_parquet_dir,
+            'db_config': {
+                'host': 'localhost',
+                'port': '3306',
+                'user': 'test',
+                'password': 'test',
+                'database': 'test'
+            },
+            'processing_interval_minutes': 5,
+            'merge_intervals': {
+                'hourly': 60,
+                'daily': 1440,
+                'monthly': 43200
+            }
+        }
+        
+        yield temp_dir, config
+        
+        # Cleanup
+        shutil.rmtree(temp_dir)
+    
+    @patch('argparse.ArgumentParser.parse_args')
+    def test_parse_arguments(self, mock_parse_args):
+        """Test argument parsing."""
+        # Test with no arguments
+        mock_parse_args.return_value = MagicMock(file=None, limit=None, skip_merge=False)
+        args = parse_arguments()
+        assert args.file is None
+        assert args.limit is None
+        assert args.skip_merge is False
+        
+        # Test with file argument
+        mock_parse_args.return_value = MagicMock(file='test.jsnl', limit=None, skip_merge=False)
+        args = parse_arguments()
+        assert args.file == 'test.jsnl'
+        
+        # Test with limit argument
+        mock_parse_args.return_value = MagicMock(file=None, limit=10, skip_merge=False)
+        args = parse_arguments()
+        assert args.limit == 10
+        
+        # Test with skip_merge argument
+        mock_parse_args.return_value = MagicMock(file=None, limit=None, skip_merge=True)
+        args = parse_arguments()
+        assert args.skip_merge is True
+    
+    def test_max_files_limit(self, setup_test_files):
+        """Test that the processor respects the max_files limit."""
+        temp_dir, config = setup_test_files
+        
+        # Create processor with limit of 2 files
+        processor = JSNLProcessor(config, max_files=2)
+        
+        # Mock the process_single_file method to avoid actual processing
+        processor.process_single_file = MagicMock(return_value='test.parquet')
+        processor.db_handler.connect = MagicMock()
+        processor.db_handler.disconnect = MagicMock()
+        
+        # Process files
+        generated_files = processor.process_jsnl_files()
+        
+        # Verify that only 2 files were processed
+        assert len(generated_files) == 2
+        assert processor.process_single_file.call_count == 2
+    
+    @patch('os.path.exists')
+    @patch('shutil.copy')
+    @patch('jsnl_processor.JSNLProcessor')
+    @patch('argparse.ArgumentParser.parse_args')
+    def test_main_with_single_file(self, mock_parse_args, mock_processor, mock_copy, mock_exists, setup_test_files):
+        """Test main function with single file option."""
+        temp_dir, config = setup_test_files
+        
+        # Setup mocks
+        mock_exists.return_value = True
+        
+        # Create a real string for the file path instead of a MagicMock
+        test_file_path = os.path.join(temp_dir, 'test.jsnl')
+        
+        # We need to patch processor.config['input_dir'] to make startswith work
+        mock_processor_instance = mock_processor.return_value
+        mock_processor_instance.config = {'input_dir': temp_dir}
+        
+        # Create args with a real string
+        mock_parse_args.return_value = MagicMock(
+            file=test_file_path, 
+            limit=None, 
+            skip_merge=False
+        )
+        
+        # Call main
+        with patch('jsnl_processor.CONFIG', config):
+            main()
+        
+        # Verify processor was created with correct parameters
+        mock_processor.assert_called_once_with(config, max_files=None)
+        
+        # Verify single file was processed
+        mock_processor_instance.process_single_file.assert_called_once()
+    
+    @patch('jsnl_processor.JSNLProcessor')
+    @patch('argparse.ArgumentParser.parse_args')
+    def test_main_with_limit(self, mock_parse_args, mock_processor, setup_test_files):
+        """Test main function with limit option."""
+        temp_dir, config = setup_test_files
+        
+        # Setup mocks
+        mock_parse_args.return_value = MagicMock(
+            file=None,  # Explicitly set to None
+            limit=3, 
+            skip_merge=False
+        )
+        
+        # Setup processor mock
+        mock_processor_instance = mock_processor.return_value
+        mock_processor_instance.db_handler = MagicMock()
+        mock_processor_instance.process_jsnl_files = MagicMock(return_value=[])
+        
+        # Call main
+        with patch('jsnl_processor.CONFIG', config):
+            main()
+        
+        # Verify processor was created with correct limit
+        mock_processor.assert_called_once_with(config, max_files=3)
+        
+        # Verify process_jsnl_files was called
+        mock_processor_instance.process_jsnl_files.assert_called_once()
+    
+    @patch('jsnl_processor.JSNLProcessor')
+    @patch('argparse.ArgumentParser.parse_args')
+    def test_main_with_skip_merge(self, mock_parse_args, mock_processor, setup_test_files):
+        """Test main function with skip_merge option."""
+        temp_dir, config = setup_test_files
+        
+        # Setup mocks
+        mock_parse_args.return_value = MagicMock(
+            file=None,  # Explicitly set to None
+            limit=None, 
+            skip_merge=True
+        )
+        
+        # Setup processor mock
+        mock_processor_instance = mock_processor.return_value
+        mock_processor_instance.db_handler = MagicMock()
+        mock_processor_instance.process_jsnl_files = MagicMock(return_value=['file1.parquet', 'file2.parquet'])
+        
+        # Call main
+        with patch('jsnl_processor.CONFIG', config):
+            main()
+        
+        # Verify merge_parquet_files was not called
+        mock_processor_instance.merge_parquet_files.assert_not_called()

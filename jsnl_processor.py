@@ -14,6 +14,7 @@ import logging
 import glob
 import shutil
 import hashlib
+import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
 import traceback
@@ -101,40 +102,74 @@ class DatabaseHandler:
             logger.info("Disconnected from MariaDB database")
             
     def store_equity(self, log_id: str, timestamp: float, mode: str, equity: float) -> None:
-        """Store equity data in the database."""
+        """Store equity data in the database idempotently."""
         if not self.conn or not self.conn.is_connected():
             self.connect()
             
         try:
             cursor = self.conn.cursor()
+            
+            # First check if record exists and is identical
+            check_query = """
+                SELECT equity FROM dashboard_equity 
+                WHERE id = %s AND timestamp = %s AND mode = %s
+            """
+            cursor.execute(check_query, (log_id, timestamp, mode))
+            result = cursor.fetchone()
+            
+            if result and abs(result[0] - equity) < 1e-10:  # Compare floats with tolerance
+                logger.debug(f"Identical equity record exists for {log_id}, skipping")
+                cursor.close()
+                return
+                
+            # Insert or update if different
             query = """
                 INSERT INTO dashboard_equity (id, timestamp, mode, equity) 
                 VALUES (%s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE timestamp = %s, mode = %s, equity = %s
+                ON DUPLICATE KEY UPDATE 
+                    equity = IF(ABS(equity - VALUES(equity)) >= 1e-10, VALUES(equity), equity)
             """
-            cursor.execute(query, (log_id, timestamp, mode, equity, timestamp, mode, equity))
+            cursor.execute(query, (log_id, timestamp, mode, equity))
             self.conn.commit()
             cursor.close()
+            
         except mysql.connector.Error as err:
             logger.error(f"Failed to store equity data: {err}")
             self.conn.rollback()
             raise
             
     def store_data(self, log_id: str, timestamp: float, mode: str, data_json: str) -> None:
-        """Store trade data in the database."""
+        """Store trade data in the database idempotently."""
         if not self.conn or not self.conn.is_connected():
             self.connect()
             
         try:
             cursor = self.conn.cursor()
+            
+            # First check if record exists and is identical
+            check_query = """
+                SELECT data_json FROM dashboard_data 
+                WHERE id = %s AND timestamp = %s AND mode = %s
+            """
+            cursor.execute(check_query, (log_id, timestamp, mode))
+            result = cursor.fetchone()
+            
+            if result and result[0] == data_json:
+                logger.debug(f"Identical trade record exists for {log_id}, skipping")
+                cursor.close()
+                return
+                
+            # Insert or update if different
             query = """
                 INSERT INTO dashboard_data (id, timestamp, mode, data_json) 
                 VALUES (%s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE timestamp = %s, mode = %s, data_json = %s
+                ON DUPLICATE KEY UPDATE 
+                    data_json = IF(data_json != VALUES(data_json), VALUES(data_json), data_json)
             """
-            cursor.execute(query, (log_id, timestamp, mode, data_json, timestamp, mode, data_json))
+            cursor.execute(query, (log_id, timestamp, mode, data_json))
             self.conn.commit()
             cursor.close()
+            
         except mysql.connector.Error as err:
             logger.error(f"Failed to store trade data: {err}")
             self.conn.rollback()
@@ -144,10 +179,11 @@ class DatabaseHandler:
 class JSNLProcessor:
     """Processes JSNL files into Parquet format and extracts data to MariaDB."""
     
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], max_files: Optional[int] = None):
         self.config = config
         self.db_handler = DatabaseHandler(config['db_config'])
         self.conn = None  # DuckDB connection
+        self.max_files = max_files  # Maximum number of files to process
         
     def init_duckdb(self) -> None:
         """Initialize DuckDB connection."""
@@ -165,6 +201,11 @@ class JSNLProcessor:
         """Generate a unique ID for a file based on its content."""
         return hashlib.md5(Path(filepath).read_bytes()).hexdigest()
     
+    def get_output_filename(self, jsnl_file: str, file_id: str) -> str:
+        """Generate a deterministic output filename."""
+        base_name = os.path.basename(jsnl_file).split('.')[0]
+        return f"{base_name}_{file_id}.parquet"
+    
     def process_jsnl_files(self) -> List[str]:
         """
         Process all JSNL files in the input directory.
@@ -174,6 +215,11 @@ class JSNLProcessor:
         if not jsnl_files:
             logger.info("No JSNL files found to process")
             return []
+            
+        # Limit the number of files if max_files is specified
+        if self.max_files is not None:
+            jsnl_files = jsnl_files[:self.max_files]
+            logger.info(f"Processing limited to {self.max_files} files")
             
         logger.info(f"Found {len(jsnl_files)} JSNL files to process")
         generated_files = []
@@ -201,12 +247,16 @@ class JSNLProcessor:
         Returns the path to the generated Parquet file.
         """
         file_id = self.get_file_id(jsnl_file)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file = os.path.join(
-            self.config['temp_dir'], 
-            f"{os.path.basename(jsnl_file).split('.')[0]}_{timestamp}_{file_id}.parquet"
+            self.config['temp_dir'],
+            self.get_output_filename(jsnl_file, file_id)
         )
         
+        # Skip if file already exists
+        if os.path.exists(output_file):
+            logger.info(f"File {output_file} already exists, skipping processing")
+            return output_file
+            
         # Data containers
         records = []
         
@@ -296,9 +346,17 @@ class JSNLProcessor:
         merged_dir = os.path.join(self.config['output_dir'], time_interval)
         os.makedirs(merged_dir, exist_ok=True)
         
-        # Path for the merged file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        merged_file = os.path.join(merged_dir, f"{time_interval}_{timestamp}.parquet")
+        # Generate deterministic merged filename based on time period
+        period_start = threshold.replace(minute=0, second=0, microsecond=0)
+        merged_file = os.path.join(
+            merged_dir, 
+            f"{time_interval}_{period_start.strftime('%Y%m%d_%H%M%S')}.parquet"
+        )
+        
+        # Skip if merged file already exists
+        if os.path.exists(merged_file):
+            logger.info(f"Merged file {merged_file} already exists, skipping merge")
+            return
         
         # Find files to merge
         temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
@@ -381,12 +439,73 @@ class JSNLProcessor:
             self.close_duckdb()
 
 
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Process JSNL files into Parquet format.')
+    parser.add_argument('--file', '-f', help='Process a single specific file')
+    parser.add_argument('--limit', '-l', type=int, help='Limit processing to N files')
+    parser.add_argument('--skip-merge', action='store_true', help='Skip the merge step')
+    return parser.parse_args()
+
+
 def main():
     """Main entry point for the script."""
     try:
+        args = parse_arguments()
         logger.info("Starting JSNL processor")
-        processor = JSNLProcessor(CONFIG)
-        processor.run()
+        
+        # Create processor with file limit if specified
+        processor = JSNLProcessor(CONFIG, max_files=args.limit)
+        
+        # Process a single file if specified
+        if args.file:
+            if not os.path.exists(args.file):
+                logger.error(f"File not found: {args.file}")
+                return 1
+                
+            logger.info(f"Processing single file: {args.file}")
+            # If the file is not in the input directory, copy it there
+            if not args.file.startswith(processor.config['input_dir']):
+                target_path = os.path.join(processor.config['input_dir'], os.path.basename(args.file))
+                shutil.copy(args.file, target_path)
+                logger.info(f"Copied file to input directory: {target_path}")
+                processor.process_single_file(target_path)
+            else:
+                processor.process_single_file(args.file)
+        else:
+            # Normal processing
+            processor.db_handler.connect()
+            processor.init_duckdb()
+            
+            # Process JSNL files
+            generated_files = processor.process_jsnl_files()
+            logger.info(f"Generated {len(generated_files)} Parquet files")
+            
+            # Skip merge if requested
+            if not args.skip_merge:
+                # Determine which merges to perform
+                current_time = datetime.now()
+                
+                # Hourly merge (every hour)
+                if current_time.minute < processor.config['processing_interval_minutes']:
+                    logger.info("Performing hourly merge")
+                    processor.merge_parquet_files('hourly')
+                    
+                # Daily merge (at midnight)
+                if current_time.hour == 0 and current_time.minute < processor.config['processing_interval_minutes']:
+                    logger.info("Performing daily merge")
+                    processor.merge_parquet_files('daily')
+                    
+                # Monthly merge (on the 1st of each month)
+                if current_time.day == 1 and current_time.hour == 0 and current_time.minute < processor.config['processing_interval_minutes']:
+                    logger.info("Performing monthly merge")
+                    processor.merge_parquet_files('monthly')
+            else:
+                logger.info("Skipping merge step as requested")
+                
+            processor.db_handler.disconnect()
+            processor.close_duckdb()
+            
         logger.info("JSNL processor completed successfully")
         return 0
     except Exception as e:
