@@ -5,6 +5,12 @@
         "Inno",
         "levelname",
         "pyarrow",
+        "pythonpath",
         "varchar"
-    ]
+    ],
+    "python.testing.pytestArgs": [
+        "tests"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true
 }

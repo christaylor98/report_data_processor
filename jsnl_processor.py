@@ -26,12 +26,27 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 load_dotenv()
+
+# Base directories
+BASE_DATA_DIR = '/data'
+PROCESS_DIR = f'{BASE_DATA_DIR}/to_process'
+PROCESSED_DIR = f'{BASE_DATA_DIR}/processed'
+PARQUET_DIR = f'{BASE_DATA_DIR}/parquet'
+LOG_DIR = 'log'
+
+# Subdirectories
+DASHBOARD_ARCHIVE_DIR = 'dashboard_data_archive'
+PARQUET_TEMP_DIR = 'temp'
+PARQUET_HOURLY_DIR = 'hourly'
+PARQUET_DAILY_DIR = 'daily'
+PARQUET_MONTHLY_DIR = 'monthly'
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/var/log/jsnl_processor.log'),
+        logging.FileHandler(os.path.join(LOG_DIR, 'jsnl_processor.log')),
         logging.StreamHandler()
     ]
 )
@@ -39,10 +54,10 @@ logger = logging.getLogger('jsnl_processor')
 
 # Configuration
 CONFIG = {
-    'input_dir': '/data/to_process/dashboard_data_archive',
-    'processed_dir': '/data/processed/dashboard_data_archive',
-    'output_dir': '/data/parquet',
-    'temp_dir': '/data/parquet/temp',
+    'input_dir': os.path.join(PROCESS_DIR, DASHBOARD_ARCHIVE_DIR),
+    'processed_dir': os.path.join(PROCESSED_DIR, DASHBOARD_ARCHIVE_DIR),
+    'output_dir': PARQUET_DIR,
+    'temp_dir': os.path.join(PARQUET_DIR, PARQUET_TEMP_DIR),
     'db_config': {
         'host': os.getenv('DB_HOST'),
         'port': os.getenv('DB_PORT'),
@@ -50,7 +65,7 @@ CONFIG = {
         'password': os.getenv('DB_PASSWORD'),
         'database': os.getenv('DB_NAME')
     },
-    'processing_interval_minutes': 10,
+    'processing_interval_minutes': 5,
     'merge_intervals': {
         'hourly': 60,  # minutes
         'daily': 1440,  # minutes (24 hours)
