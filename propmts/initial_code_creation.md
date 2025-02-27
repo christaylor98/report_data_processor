@@ -32,6 +32,7 @@ Maria DB table for equity:
 CREATE TABLE IF NOT EXISTS `dashboard_equity` (
   `id` varchar(255) NOT NULL,
   `timestamp` double NOT NULL,
+  `mode` varchar(255) NOT NULL,
   `equity` double NOT NULL,
   PRIMARY KEY (`id`),
   INDEX `idx_timestamp` (`timestamp`)
@@ -41,9 +42,10 @@ CREATE TABLE IF NOT EXISTS `dashboard_equity` (
 Maria DB table for trades:
 ```
 CREATE TABLE IF NOT EXISTS `dashboard_trades` (
-  `id` varchar(255) NOT NULL,
   `timestamp` double NOT NULL,
+  `id` varchar(255) NOT NULL,
   `trade_event_json` text NOT NULL,
+  `mode` varchar(255) NOT NULL,
   PRIMARY KEY (`id`),
   INDEX `idx_timestamp` (`timestamp`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

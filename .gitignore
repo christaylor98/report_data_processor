@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 Cargo.lock
+.env
+env
+market_data_analysis/
+misc/

@@ -5,24 +5,27 @@ JSNL to Parquet Processor
 This script processes JSNL files into Parquet format using DuckDB.
 It also extracts trade and equity data to MariaDB.
 """
-
+#pylint: disable=W1203, W0718, C0301, C0303
 import json
 import os
 import sys
 import logging
-import time
+# import time
 import glob
 import shutil
 import hashlib
-import mysql.connector
 from datetime import datetime, timedelta
 from pathlib import Path
+import traceback
+from typing import List, Dict, Any, Optional
+
+from dotenv import load_dotenv
+import mysql.connector
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
-import traceback
-from typing import List, Dict, Any, Optional, Tuple
 
+load_dotenv()
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -36,15 +39,16 @@ logger = logging.getLogger('jsnl_processor')
 
 # Configuration
 CONFIG = {
-    'input_dir': '/var/data/jsnl',
-    'processed_dir': '/var/data/jsnl/processed',
-    'output_dir': '/var/data/parquet',
-    'temp_dir': '/var/data/parquet/temp',
+    'input_dir': '/data/to_process/dashboard_data_archive',
+    'processed_dir': '/data/processed/dashboard_data_archive',
+    'output_dir': '/data/parquet',
+    'temp_dir': '/data/parquet/temp',
     'db_config': {
-        'host': 'localhost',
-        'user': 'dbuser',
-        'password': 'dbpassword',
-        'database': 'trading'
+        'host': os.getenv('DB_HOST'),
+        'port': os.getenv('DB_PORT'),
+        'user': os.getenv('DB_USER'),
+        'password': os.getenv('DB_PASSWORD'),
+        'database': os.getenv('DB_NAME')
     },
     'processing_interval_minutes': 10,
     'merge_intervals': {
@@ -81,7 +85,7 @@ class DatabaseHandler:
             self.conn.close()
             logger.info("Disconnected from MariaDB database")
             
-    def store_equity(self, log_id: str, timestamp: float, equity: float) -> None:
+    def store_equity(self, log_id: str, timestamp: float, mode: str, equity: float) -> None:
         """Store equity data in the database."""
         if not self.conn or not self.conn.is_connected():
             self.connect()
@@ -89,11 +93,11 @@ class DatabaseHandler:
         try:
             cursor = self.conn.cursor()
             query = """
-                INSERT INTO dashboard_equity (id, timestamp, equity) 
-                VALUES (%s, %s, %s)
-                ON DUPLICATE KEY UPDATE timestamp = %s, equity = %s
+                INSERT INTO dashboard_equity (id, timestamp, mode, equity) 
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE timestamp = %s, mode = %s, equity = %s
             """
-            cursor.execute(query, (log_id, timestamp, equity, timestamp, equity))
+            cursor.execute(query, (log_id, timestamp, mode, equity, timestamp, mode, equity))
             self.conn.commit()
             cursor.close()
         except mysql.connector.Error as err:
@@ -101,7 +105,7 @@ class DatabaseHandler:
             self.conn.rollback()
             raise
             
-    def store_trade(self, log_id: str, timestamp: float, trade_event_json: str) -> None:
+    def store_data(self, log_id: str, timestamp: float, mode: str, data_json: str) -> None:
         """Store trade data in the database."""
         if not self.conn or not self.conn.is_connected():
             self.connect()
@@ -109,11 +113,11 @@ class DatabaseHandler:
         try:
             cursor = self.conn.cursor()
             query = """
-                INSERT INTO dashboard_trades (id, timestamp, trade_event_json) 
-                VALUES (%s, %s, %s)
-                ON DUPLICATE KEY UPDATE timestamp = %s, trade_event_json = %s
+                INSERT INTO dashboard_data (id, timestamp, mode, data_json) 
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE timestamp = %s, mode = %s, data_json = %s
             """
-            cursor.execute(query, (log_id, timestamp, trade_event_json, timestamp, trade_event_json))
+            cursor.execute(query, (log_id, timestamp, mode, data_json, timestamp, mode, data_json))
             self.conn.commit()
             cursor.close()
         except mysql.connector.Error as err:
@@ -194,7 +198,7 @@ class JSNLProcessor:
         logger.info(f"Processing file {jsnl_file}")
         
         try:
-            with open(jsnl_file, 'r') as f:
+            with open(jsnl_file, 'r', encoding='utf-8') as f:
                 line_count = 0
                 for line in f:
                     line_count += 1
@@ -202,9 +206,10 @@ class JSNLProcessor:
                         data = json.loads(line)
                         
                         # Extract required fields
-                        log_id = data.get('log_id', '')
+                        log_id = data.get('id', '')
                         timestamp = data.get('timestamp', 0.0)
                         value = data.get('value', [])
+                        mode = data.get('mode', 'real-time')
                         
                         # Process record for Parquet
                         records.append({
@@ -217,11 +222,11 @@ class JSNLProcessor:
                         for item in value:
                             if isinstance(item, dict) and item.get('t') == 'e' and 'equity' in item:
                                 equity = float(item.get('equity', 0.0))
-                                self.db_handler.store_equity(log_id, timestamp, equity)
+                                self.db_handler.store_equity(log_id, timestamp, mode, equity)
                             
                             # Check for trade events
                             if isinstance(item, dict) and item.get('t') in ['open', 'close', 'adjust-open']:
-                                self.db_handler.store_trade(log_id, timestamp, json.dumps(item))
+                                self.db_handler.store_data(log_id, timestamp, mode, json.dumps(item))
                     
                     except json.JSONDecodeError:
                         logger.warning(f"Invalid JSON on line {line_count} in {jsnl_file}")
@@ -376,4 +381,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main()) 
+    sys.exit(main())
