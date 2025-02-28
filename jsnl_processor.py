@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import traceback
 from typing import List, Dict, Any, Optional, Tuple, Set
-import time
+# import time
 
 from dotenv import load_dotenv
 import mysql.connector
@@ -61,13 +61,6 @@ CONFIG = {
     'processed_dir': os.path.join(PROCESSED_DIR, DASHBOARD_ARCHIVE_DIR),
     'output_dir': PARQUET_DIR,
     'temp_dir': os.path.join(PARQUET_DIR, PARQUET_TEMP_DIR),
-    'db_config': {
-        'host': os.getenv('DB_HOST'),
-        'port': os.getenv('DB_PORT'),
-        'user': os.getenv('DB_USER'),
-        'password': os.getenv('DB_PASSWORD'),
-        'database': os.getenv('DB_NAME')
-    },
     'processing_interval_minutes': 5,
     'merge_intervals': {
         'hourly': 60,  # minutes
@@ -92,7 +85,21 @@ class DatabaseHandler:
     def connect(self) -> None:
         """Connect to the database."""
         try:
-            self.conn = mysql.connector.connect(**self.config['db_config'])
+            # Check if db_config exists in the configuration
+            if 'db_config' not in self.config:
+                logger.warning("Database configuration missing. Using environment variables.")
+                # Use environment variables as fallback
+                db_config = {
+                    'host': os.getenv('DB_HOST', 'localhost'),
+                    'port': os.getenv('DB_PORT', '3306'),
+                    'user': os.getenv('DB_USER', 'root'),
+                    'password': os.getenv('DB_PASSWORD', ''),
+                    'database': os.getenv('DB_NAME', 'trading')
+                }
+            else:
+                db_config = self.config['db_config']
+            
+            self.conn = mysql.connector.connect(**db_config)
             self.cursor = self.conn.cursor()
             logger.info("Connected to database")
         except mysql.connector.Error as e:
@@ -235,13 +242,24 @@ class DatabaseHandler:
 
 
 class JSNLProcessor:
-    """Processes JSNL files into Parquet format and extracts data to MariaDB."""
+    """Process JSNL files into Parquet format."""
     
     def __init__(self, config: Dict[str, Any], max_files: Optional[int] = None):
+        """
+        Initialize the processor with configuration.
+        
+        Args:
+            config: Configuration dictionary
+            max_files: Maximum number of files to process (optional)
+        """
         self.config = config
-        self.db_handler = DatabaseHandler(config['db_config'])
-        self.conn = None  # DuckDB connection
-        self.max_files = max_files  # Maximum number of files to process
+        self.max_files = max_files
+        
+        # Initialize database handler
+        self.db_handler = DatabaseHandler(config)
+        
+        # Initialize DuckDB connection
+        self.conn = None
         
     def init_duckdb(self) -> None:
         """Initialize DuckDB connection."""
@@ -266,75 +284,77 @@ class JSNLProcessor:
     
     def process_jsnl_files(self) -> List[str]:
         """
-        Process all JSNL files in the input directory in chronological order.
-        Returns a list of generated Parquet files.
+        Process all JSNL files in the input directory.
+        
+        Returns:
+            List of generated Parquet file paths
         """
+        # Find all JSNL files in the input directory
         jsnl_files = glob.glob(os.path.join(self.config['input_dir'], '*.jsnl'))
+        
         if not jsnl_files:
-            logger.info("No JSNL files found to process")
+            logger.info("No JSNL files found in input directory")
             return []
         
-        # Sort files by timestamp in filename
-        # Assuming filenames are in format: dashboard_data_YYYYMMDD_HHMMSS.jsnl
-        def extract_timestamp(filename):
-            try:
-                # Extract date and time parts from filename
-                base_name = os.path.basename(filename)
-                parts = base_name.split('_')
-                if len(parts) >= 4:
-                    date_part = parts[2]  # YYYYMMDD
-                    time_part = parts[3].split('.')[0]  # HHMMSS
-                    
-                    # Parse date and time
-                    if len(date_part) == 8 and len(time_part) == 6:
-                        dt_str = f"{date_part}_{time_part}"
-                        dt = datetime.strptime(dt_str, "%Y%m%d_%H%M%S")
-                        return dt.timestamp()
-                
-                # If we can't parse the timestamp, use file modification time as fallback
-                return os.path.getmtime(filename)
-            except Exception as e:
-                logger.warning(f"Could not extract timestamp from filename {filename}: {str(e)}")
-                return os.path.getmtime(filename)
+        # Sort files by timestamp in filename (if available)
+        sorted_files = self.sort_files_by_timestamp(jsnl_files)
         
-        # Sort files by extracted timestamp
-        jsnl_files.sort(key=extract_timestamp)
-        logger.info(f"Sorted {len(jsnl_files)} files by timestamp in filename")
-        
-        # Limit the number of files if max_files is specified
-        if self.max_files is not None:
-            jsnl_files = jsnl_files[:self.max_files]
+        # Limit the number of files to process if specified
+        if self.max_files and len(sorted_files) > self.max_files:
+            logger.info(f"Sorted {len(sorted_files)} files by timestamp in filename")
             logger.info(f"Processing limited to {self.max_files} files")
+            sorted_files = sorted_files[:self.max_files]
         
-        logger.info(f"Found {len(jsnl_files)} JSNL files to process")
+        logger.info(f"Found {len(sorted_files)} JSNL files to process")
+        
+        # Process each file
         generated_files = []
-        data_timestamps = set()  # Track timestamps from the data
+        timestamps = set()
         
-        for jsnl_file in jsnl_files:
+        for jsnl_file in sorted_files:
             try:
                 logger.info(f"Processing file in order: {os.path.basename(jsnl_file)}")
-                output_file, timestamps = self.process_single_file(jsnl_file)
-                if output_file:
-                    generated_files.append(output_file)
-                    data_timestamps.update(timestamps)
-                    
-                # Move processed file
-                processed_path = os.path.join(self.config['processed_dir'], os.path.basename(jsnl_file))
-                shutil.move(jsnl_file, processed_path)
-                logger.info(f"Moved processed file to {processed_path}")
                 
+                # Check if file still exists before processing
+                if not os.path.exists(jsnl_file):
+                    logger.warning(f"File no longer exists, skipping: {jsnl_file}")
+                    continue
+                    
+                # Process the file
+                result = self.process_single_file(jsnl_file)
+                
+                if result[0]:  # If a Parquet file was generated
+                    generated_files.append(result[0])
+                    timestamps.update(result[1])
+                
+                # Move the file to the processed directory
+                processed_path = os.path.join(self.config['processed_dir'], os.path.basename(jsnl_file))
+                
+                # Check if file still exists before moving
+                if os.path.exists(jsnl_file):
+                    try:
+                        shutil.move(jsnl_file, processed_path)
+                        logger.info(f"Moved processed file to {processed_path}")
+                    except (shutil.Error, OSError) as e:
+                        logger.warning(f"Could not move file {jsnl_file} to {processed_path}: {str(e)}")
+                else:
+                    logger.warning(f"File no longer exists, cannot move: {jsnl_file}")
+                    
             except Exception as e:
                 logger.error(f"Error processing file {jsnl_file}: {str(e)}")
                 logger.error(traceback.format_exc())
-                
-        # Perform weekly merge based on data timestamps
-        if data_timestamps:
-            min_ts = min(data_timestamps)
-            max_ts = max(data_timestamps)
-            logger.info(f"Data timestamps range from {datetime.fromtimestamp(min_ts)} to {datetime.fromtimestamp(max_ts)}")
-            
-            # Create weekly files
-            logger.info("Creating weekly Parquet files")
+        
+        # If we have timestamps, log the range
+        if timestamps:
+            min_ts = min(timestamps)
+            max_ts = max(timestamps)
+            min_dt = datetime.fromtimestamp(min_ts)
+            max_dt = datetime.fromtimestamp(max_ts)
+            logger.info(f"Data timestamps range from {min_dt} to {max_dt}")
+        
+        # Create weekly Parquet files from temp files
+        logger.info("Creating weekly Parquet files")
+        if timestamps:
             self.create_weekly_files(min_ts, max_ts)
         
         return generated_files
@@ -351,6 +371,11 @@ class JSNLProcessor:
         """
         logger.info(f"Processing file {file_path}")
         
+        # Check if file exists
+        if not os.path.exists(file_path):
+            logger.warning(f"File does not exist: {file_path}")
+            return None, set()
+        
         # Generate a unique ID for this file based on content
         file_id = self.get_file_id(file_path)
         
@@ -363,10 +388,13 @@ class JSNLProcessor:
             logger.info(f"File {output_file} already exists, skipping processing")
             
             # Move the original file to processed directory if needed
-            if os.path.dirname(file_path) == self.config['input_dir']:
+            if os.path.dirname(file_path) == self.config['input_dir'] and os.path.exists(file_path):
                 processed_path = os.path.join(self.config['processed_dir'], os.path.basename(file_path))
-                shutil.move(file_path, processed_path)
-                logger.info(f"Moved processed file to {processed_path}")
+                try:
+                    shutil.move(file_path, processed_path)
+                    logger.info(f"Moved processed file to {processed_path}")
+                except (shutil.Error, OSError) as e:
+                    logger.warning(f"Could not move file {file_path} to {processed_path}: {str(e)}")
             
             # Return the existing file path and an empty set of timestamps
             return output_file, set()
@@ -388,6 +416,11 @@ class JSNLProcessor:
         equity_records_data = {}  # Format: {(log_id, timestamp): equity_record}
         
         try:
+            # Check again if file exists before opening
+            if not os.path.exists(file_path):
+                logger.warning(f"File disappeared during processing: {file_path}")
+                return None, set()
+            
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
                     total_records += 1
@@ -419,7 +452,7 @@ class JSNLProcessor:
                                     has_candle = True
                                     break
                         else:
-                            has_candle = (value_obj.get('t') == 'c')
+                            has_candle = value_obj.get('t') == 'c'
                         
                         # Skip lines without candles
                         if not has_candle:
@@ -616,311 +649,141 @@ class JSNLProcessor:
         
         logger.info(f"Saved Parquet file with optimizations for trade data: {output_file}")
     
-    def create_weekly_files(self, min_ts: float, max_ts: float) -> None:
+    def create_weekly_files(self, min_timestamp: float, max_timestamp: float) -> None:
         """
         Create weekly Parquet files from temp files.
         
         Args:
-            min_ts: Minimum timestamp to include
-            max_ts: Maximum timestamp to include
+            min_timestamp: Minimum timestamp in the data
+            max_timestamp: Maximum timestamp in the data
         """
-        # Ensure output directory exists
-        weekly_dir = os.path.join(self.config['output_dir'], 'weekly')
-        os.makedirs(weekly_dir, exist_ok=True)
-        
-        # Convert timestamps to datetime for interval calculations
-        start_dt = datetime.fromtimestamp(min_ts)
-        end_dt = datetime.fromtimestamp(max_ts)
-        
-        # Round to the start of the week (Monday)
-        start_dt = start_dt - timedelta(days=start_dt.weekday())
-        start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        # Find all temp files
-        temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
-        if not temp_files:
-            logger.info("No temp files found to merge into weekly files")
-            return
-        
-        # Group files by week
-        weekly_files = {}
-        
-        # Read each temp file to get its timestamps
-        for temp_file in temp_files:
-            try:
-                # Read the Parquet file to get timestamps
-                table = pq.read_table(temp_file, columns=['timestamp'])
-                df = table.to_pandas()
-                
-                if df.empty:
-                    continue
-                    
-                # Group records by week
-                for ts in df['timestamp']:
-                    dt = datetime.fromtimestamp(ts)
-                    # Get the start of the week (Monday)
-                    week_start = dt - timedelta(days=dt.weekday())
-                    week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
-                    
-                    # Skip if outside our range
-                    if week_start < start_dt or week_start > end_dt:
-                        continue
-                        
-                    week_key = week_start.strftime('%Y%m%d')
-                    if week_key not in weekly_files:
-                        weekly_files[week_key] = []
-                    
-                    if temp_file not in weekly_files[week_key]:
-                        weekly_files[week_key].append(temp_file)
-                    
-            except Exception as e:
-                logger.error(f"Error reading timestamps from {temp_file}: {str(e)}")
-        
-        # If no files were grouped, exit
-        if not weekly_files:
-            logger.info("No data found in the specified time range for weekly files")
-            return
-        
-        # Process each week that has files
-        processed_temp_files = set()
-        
-        for week_key, files in weekly_files.items():
-            try:
-                # Parse the week start time
-                week_start = datetime.strptime(week_key, '%Y%m%d')
-                week_end = week_start + timedelta(days=7)
-                
-                # Create the output filename
-                output_file = os.path.join(weekly_dir, f"weekly_{week_key}.parquet")
-                
-                # Check if file already exists (idempotent)
-                if os.path.exists(output_file):
-                    logger.info(f"Weekly file already exists: {output_file}, skipping")
-                    continue
-                
-                # Convert the list to a proper array for DuckDB
-                files_array = "[" + ", ".join(f"'{file}'" for file in files) + "]"
-                
-                # Create a temporary table for the merged data
-                self.conn.execute(f"""
-                    CREATE OR REPLACE TABLE merged AS
-                    SELECT * FROM parquet_scan({files_array})
-                    WHERE timestamp >= {week_start.timestamp()} AND timestamp < {week_end.timestamp()}
-                    ORDER BY timestamp, log_id
-                """)
-                
-                # Check if there are any records in this period
-                result = self.conn.execute("SELECT COUNT(*) FROM merged").fetchone()
-                if result[0] == 0:
-                    logger.info(f"No records found for week {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}, skipping")
-                    continue
-                
-                # Write the merged data to a Parquet file
-                self.conn.execute(f"""
-                    COPY merged TO '{output_file}' (FORMAT 'parquet')
-                """)
-                
-                logger.info(f"Created weekly file for period {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}: {output_file}")
-                logger.info(f"Merged {len(files)} temp files")
-                
-                # Mark these files as processed
-                for file in files:
-                    processed_temp_files.add(file)
-                
-            except Exception as e:
-                logger.error(f"Failed to create weekly file for week {week_key}: {str(e)}")
-                logger.error(traceback.format_exc())
-        
-        # After all merges complete, clean up temp files that were successfully merged
-        self.cleanup_temp_files(processed_temp_files)
-    
-    def cleanup_temp_files(self, processed_files: Set[str]) -> None:
-        """
-        Clean up temporary Parquet files that have been successfully merged.
-        
-        Args:
-            processed_files: Set of file paths that were successfully merged
-        """
-        try:
-            temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
-            
-            for temp_file in temp_files:
-                if temp_file in processed_files:
-                    try:
-                        os.remove(temp_file)
-                        logger.info(f"Removed processed temp file: {temp_file}")
-                    except OSError as e:
-                        logger.error(f"Failed to remove temp file {temp_file}: {str(e)}")
-                else:
-                    logger.debug(f"Keeping unprocessed temp file: {temp_file}")
-                
-        except Exception as e:
-            logger.error(f"Error during temp file cleanup: {str(e)}")
-            logger.error(traceback.format_exc())
-    
-    def cleanup_old_temp_files(self, max_age_days: int = 7) -> None:
-        """
-        Clean up any temporary files older than the specified number of days.
-        
-        Args:
-            max_age_days: Maximum age of temp files in days
-        """
-        try:
-            temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
-            cutoff_time = time.time() - (max_age_days * 24 * 60 * 60)
-            
-            for temp_file in temp_files:
-                try:
-                    file_mtime = os.path.getmtime(temp_file)
-                    if file_mtime < cutoff_time:
-                        os.remove(temp_file)
-                        logger.warning(f"Removed old temp file: {temp_file} (age: {(time.time() - file_mtime) / 86400:.1f} days)")
-                except OSError as e:
-                    logger.error(f"Failed to process old temp file {temp_file}: {str(e)}")
-                
-        except Exception as e:
-            logger.error(f"Error during old temp file cleanup: {str(e)}")
-            logger.error(traceback.format_exc())
-    
-    def rollup_to_larger_interval(self, source_interval: str, target_interval: str, min_ts: float, max_ts: float) -> None:
-        """
-        Roll up files from a smaller interval to a larger interval.
-        For example, hourly to daily or daily to monthly.
-        """
-        # Get source and target directories
-        source_dir = os.path.join(self.config['output_dir'], source_interval)
-        target_dir = os.path.join(self.config['output_dir'], target_interval)
-        
-        # Ensure target directory exists
-        os.makedirs(target_dir, exist_ok=True)
-        
         # Convert timestamps to datetime
-        start_dt = datetime.fromtimestamp(min_ts)
-        end_dt = datetime.fromtimestamp(max_ts)
+        min_dt = datetime.fromtimestamp(min_timestamp)
+        max_dt = datetime.fromtimestamp(max_timestamp)
         
-        # Initialize delta for all cases
-        delta = timedelta(days=1)  # Default value
+        # Get the start of the week for min_dt (Monday)
+        start_of_week = min_dt - timedelta(days=min_dt.weekday())
+        start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # Set up interval parameters
-        if target_interval == 'daily':
-            # For daily, round to the start of the day
-            start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-            delta = timedelta(days=1)
-            format_str = '%Y%m%d_000000'
-        elif target_interval == 'monthly':
-            # For monthly, round to the start of the month
-            start_dt = start_dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            format_str = '%Y%m01_000000'
-        else:
-            logger.error(f"Invalid target interval: {target_interval}")
-            return
+        # Get the start of the next week for max_dt
+        end_of_week = max_dt + timedelta(days=(7 - max_dt.weekday()) % 7)
+        end_of_week = end_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # Process each time period
-        current_dt = start_dt
-        processed_source_files = set()
-        
-        while current_dt <= end_dt:
-            # Calculate the next period
-            if target_interval == 'monthly':
-                next_dt = (current_dt.replace(day=1) + timedelta(days=32)).replace(day=1)
-            else:
-                next_dt = current_dt + delta
+        # Create weekly files
+        current_week = start_of_week
+        while current_week < end_of_week:
+            next_week = current_week + timedelta(days=7)
             
-            # Format the period for the output filename
-            period_str = current_dt.strftime(format_str)
+            # Create weekly file name
+            weekly_file = os.path.join(
+                self.config['output_dir'], 
+                'weekly', 
+                f"weekly_{current_week.strftime('%Y%m%d')}.parquet"
+            )
             
-            try:
-                # Create the output filename
-                output_file = os.path.join(target_dir, f"{target_interval}_{period_str}.parquet")
-                
-                # Check if the file already exists (idempotent)
-                if os.path.exists(output_file):
-                    logger.info(f"Merged file already exists: {output_file}, skipping")
-                else:
-                    # Find source files that fall within this period
-                    filtered_source_files = []  # Initialize here to avoid reference before assignment
-                    
-                    if source_interval == 'hourly':
-                        source_pattern = f"{source_interval}_*.parquet"
-                        source_files = glob.glob(os.path.join(source_dir, source_pattern))
-                        
-                        # Filter files by timestamp range
-                        for file in source_files:
-                            try:
-                                # Extract date and time from filename
-                                filename = os.path.basename(file)
-                                parts = filename.split('_')
-                                if len(parts) >= 3:
-                                    dt_str = f"{parts[1]}_{parts[2].split('.')[0]}"
-                                    dt = datetime.strptime(dt_str, "%Y%m%d_%H%M%S")
-                                    if current_dt <= dt < next_dt:
-                                        filtered_source_files.append(file)
-                                        processed_source_files.add(file)
-                            except Exception as e:
-                                logger.warning(f"Could not extract timestamp from filename {file}: {str(e)}")
-                    elif source_interval == 'daily':
-                        source_pattern = f"{source_interval}_*.parquet"
-                        source_files = glob.glob(os.path.join(source_dir, source_pattern))
-                        
-                        # Filter files by timestamp range
-                        for file in source_files:
-                            try:
-                                # Extract date from filename
-                                filename = os.path.basename(file)
-                                parts = filename.split('_')
-                                if len(parts) >= 2:
-                                    dt_str = parts[1]
-                                    dt = datetime.strptime(dt_str, "%Y%m%d")
-                                    if current_dt.replace(day=1) <= dt < next_dt:
-                                        filtered_source_files.append(file)
-                                        processed_source_files.add(file)
-                            except Exception as e:
-                                logger.warning(f"Could not extract timestamp from filename {file}: {str(e)}")
-                    
-                    # If we found source files, merge them
-                    if filtered_source_files:
-                        # Convert the list to a proper array for DuckDB
-                        files_array = "[" + ", ".join(f"'{file}'" for file in filtered_source_files) + "]"
-                        
-                        # Create a temporary table for the merged data
-                        self.conn.execute(f"""
-                            CREATE OR REPLACE TABLE merged AS
-                            SELECT * FROM parquet_scan({files_array})
-                            WHERE timestamp >= {current_dt.timestamp()} AND timestamp < {next_dt.timestamp()}
-                            ORDER BY timestamp, log_id
-                        """)
-                        
-                        # Check if there are any records in this period
-                        result = self.conn.execute("SELECT COUNT(*) FROM merged").fetchone()
-                        if result[0] == 0:
-                            logger.info(f"No records found for period {current_dt} to {next_dt}, skipping")
-                            continue
-                        
-                        # Write the merged data to a Parquet file
-                        self.conn.execute(f"""
-                            COPY merged TO '{output_file}' (FORMAT 'parquet')
-                        """)
-                        
-                        logger.info(f"Created {target_interval} file for period {current_dt} to {next_dt}: {output_file}")
-                        logger.info(f"Merged {len(filtered_source_files)} {source_interval} files")
-                    else:
-                        logger.info(f"No {source_interval} files found for period {current_dt} to {next_dt}")
-                
-            except Exception as e:
-                logger.error(f"Failed to create {target_interval} file for period {current_dt}: {str(e)}")
-                logger.error(traceback.format_exc())
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(weekly_file), exist_ok=True)
             
-            current_dt = next_dt
-        
-        # Remove source files that were successfully rolled up
-        if processed_source_files:
-            logger.info(f"Removing {len(processed_source_files)} {source_interval} files that were rolled up to {target_interval}")
-            for file in processed_source_files:
+            # Find temp files in this date range
+            temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
+            
+            # Filter files by timestamp range
+            filtered_temp_files = []
+            for temp_file in temp_files:
                 try:
-                    os.remove(file)
-                    logger.debug(f"Removed {source_interval} file after rollup: {file}")
-                except OSError as e:
-                    logger.error(f"Failed to remove {source_interval} file {file}: {str(e)}")
+                    # Read the Parquet file to get timestamps
+                    table = pq.read_table(temp_file)
+                    df = table.to_pandas()
+                    
+                    # Check if any timestamps fall within this week
+                    if 'timestamp' in df.columns:
+                        timestamps = df['timestamp'].values
+                        if any((ts >= current_week.timestamp() and ts < next_week.timestamp()) for ts in timestamps):
+                            filtered_temp_files.append(temp_file)
+                except Exception as e:
+                    logger.error(f"Error reading temp file {temp_file}: {str(e)}")
+            
+            # If we found temp files, merge them
+            if filtered_temp_files:
+                try:
+                    # Create a DuckDB query to merge the files
+                    files_array = "[" + ", ".join(f"'{file}'" for file in filtered_temp_files) + "]"
+                    
+                    # Create a temporary table for the merged data
+                    self.conn.execute(f"""
+                        CREATE OR REPLACE TABLE merged AS
+                        SELECT * FROM parquet_scan({files_array})
+                        WHERE timestamp >= {current_week.timestamp()} AND timestamp < {next_week.timestamp()}
+                        ORDER BY timestamp, log_id
+                    """)
+                    
+                    # Check if there are any records in this period
+                    result = self.conn.execute("SELECT COUNT(*) FROM merged").fetchone()
+                    if result[0] == 0:
+                        logger.info(f"No records found for period {current_week} to {next_week}, skipping")
+                        current_week = next_week
+                        continue
+                    
+                    # Write the merged data to a Parquet file
+                    self.conn.execute(f"""
+                        COPY merged TO '{weekly_file}' (FORMAT 'parquet')
+                    """)
+                    
+                    logger.info(f"Created weekly file for period {current_week} to {next_week}: {weekly_file}")
+                    logger.info(f"Merged {len(filtered_temp_files)} temp files")
+                    
+                    # Remove the temp files that were merged
+                    for temp_file in filtered_temp_files:
+                        try:
+                            os.remove(temp_file)
+                            logger.info(f"Removed processed temp file: {temp_file}")
+                        except OSError as e:
+                            logger.error(f"Failed to remove temp file {temp_file}: {str(e)}")
+                except Exception as e:
+                    logger.error(f"Failed to create weekly file for period {current_week}: {str(e)}")
+                    logger.error(traceback.format_exc())
+            else:
+                logger.info(f"No temp files found for period {current_week} to {next_week}")
+            
+            current_week = next_week
+    
+    def sort_files_by_timestamp(self, jsnl_files: List[str]) -> List[str]:
+        """
+        Sort files by timestamp in filename.
+        
+        Args:
+            jsnl_files: List of file paths to sort
+            
+        Returns:
+            Sorted list of file paths
+        """
+        # Assuming filenames are in format: dashboard_data_YYYYMMDD_HHMMSS.jsnl
+        def extract_timestamp(filename):
+            try:
+                # Extract date and time parts from filename
+                base_name = os.path.basename(filename)
+                parts = base_name.split('_')
+                if len(parts) >= 4:
+                    date_part = parts[2]  # YYYYMMDD
+                    time_part = parts[3].split('.')[0]  # HHMMSS
+                    
+                    # Parse date and time
+                    if len(date_part) == 8 and len(time_part) == 6:
+                        dt_str = f"{date_part}_{time_part}"
+                        dt = datetime.strptime(dt_str, "%Y%m%d_%H%M%S")
+                        return dt.timestamp()
+                
+                # If we can't parse the timestamp, use file modification time as fallback
+                return os.path.getmtime(filename)
+            except Exception as e:
+                logger.warning(f"Could not extract timestamp from filename {filename}: {str(e)}")
+                return os.path.getmtime(filename)
+        
+        # Sort files by extracted timestamp
+        sorted_files = sorted(jsnl_files, key=extract_timestamp)
+        logger.info(f"Sorted {len(sorted_files)} files by timestamp in filename")
+        
+        return sorted_files
     
     def run(self) -> None:
         """Run the JSNL processing pipeline."""
@@ -943,6 +806,50 @@ class JSNLProcessor:
             self.db_handler.disconnect()
             self.close_duckdb()
 
+    def cleanup_old_temp_files(self) -> None:
+        """
+        Clean up old temporary Parquet files that are no longer needed.
+        
+        This method removes temporary files that are older than a certain threshold
+        and have already been merged into weekly files.
+        """
+        try:
+            # Get all temp files
+            temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
+            
+            if not temp_files:
+                logger.info("No temporary files to clean up")
+                return
+            
+            # Get current time
+            now = datetime.now()
+            
+            # Define threshold for old files (default: 7 days)
+            threshold_days = 7
+            threshold = now - timedelta(days=threshold_days)
+            
+            # Count of removed files
+            removed_count = 0
+            
+            # Check each file
+            for temp_file in temp_files:
+                try:
+                    # Get file modification time
+                    mod_time = datetime.fromtimestamp(os.path.getmtime(temp_file))
+                    
+                    # If file is older than threshold, remove it
+                    if mod_time < threshold:
+                        os.remove(temp_file)
+                        logger.info(f"Removed old temp file: {temp_file}")
+                        removed_count += 1
+                except OSError as e:
+                    logger.error(f"Failed to check or remove temp file {temp_file}: {str(e)}")
+            
+            logger.info(f"Cleaned up {removed_count} old temporary files")
+        except Exception as e:
+            logger.error(f"Error cleaning up old temp files: {str(e)}")
+            logger.error(traceback.format_exc())
+
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -957,6 +864,16 @@ def main():
     try:
         args = parse_arguments()
         logger.info("Starting JSNL processor")
+        
+        # Ensure configuration has db_config
+        if 'db_config' not in CONFIG:
+            CONFIG['db_config'] = {
+                'host': os.getenv('DB_HOST', 'localhost'),
+                'port': os.getenv('DB_PORT', '3306'),
+                'user': os.getenv('DB_USER', 'root'),
+                'password': os.getenv('DB_PASSWORD', ''),
+                'database': os.getenv('DB_NAME', 'trading')
+            }
         
         # Create processor with file limit if specified
         processor = JSNLProcessor(CONFIG, max_files=args.limit)

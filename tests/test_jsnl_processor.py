@@ -20,7 +20,7 @@ import pyarrow as pa
 
 from jsnl_processor import JSNLProcessor, DatabaseHandler, CONFIG, parse_arguments, main
 
-#pylint: disable=W1203, W0718, C0301, C0303
+#pylint: disable=W1203, W0718, C0301, C0303, C0302
 
 @pytest.fixture
 def test_config():
@@ -415,11 +415,19 @@ def test_full_pipeline(test_config, sample_jsnl_file, mock_db_handler):
         assert mock_create_weekly.call_count == 0  # It's not called directly by process_single_file
     
     # Now test the process_jsnl_files method which should call create_weekly_files
-    with patch.object(processor, 'process_jsnl_files') as mock_process_jsnl:
+    with patch.object(processor, 'process_jsnl_files') as mock_process_jsnl, \
+         patch.object(processor, 'cleanup_old_temp_files') as mock_cleanup:
+        # Set up the mock to return an empty list
+        mock_process_jsnl.return_value = []
+        
         # Call run which should call process_jsnl_files
         processor.run()
+        
         # Verify process_jsnl_files was called
-        assert mock_process_jsnl.call_count == 1
+        mock_process_jsnl.assert_called_once()
+        
+        # Verify cleanup_old_temp_files was called
+        mock_cleanup.assert_called_once()
     
     processor.db_handler.disconnect()
     processor.close_duckdb()
