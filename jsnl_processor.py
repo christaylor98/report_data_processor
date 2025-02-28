@@ -143,7 +143,7 @@ class DatabaseHandler:
             """
             
             # Extract broker name (mode)
-            broker = record.get('value', {}).get('b', 'unknown')
+            _broker = record.get('value', {}).get('b', 'unknown')
             
             # Execute query
             self.cursor.execute(
@@ -151,7 +151,7 @@ class DatabaseHandler:
                 (
                     record['log_id'],
                     record['timestamp'],
-                    broker,
+                    record['mode'],
                     record['value'].get('equity', 0.0),
                     candle_data
                 )
@@ -178,10 +178,18 @@ class DatabaseHandler:
             # Log the trade data being stored
             logger.debug(f"Storing trade data: id={data['log_id']}, timestamp={data['timestamp']}, type={data['type']}")
             
+            # Create JSON data for the dashboard_data table
+            json_data = json.dumps({
+                "instrument": data['instrument'],
+                "price": data['price'],
+                "profit": data['profit'],
+                "t": data['type']
+            })
+            
             # Check if a record with this timestamp, id, and type already exists
             check_query = """
-            SELECT id FROM trading.dashboard_trades 
-            WHERE id = %s AND timestamp = %s AND type = %s
+            SELECT id FROM trading.dashboard_data 
+            WHERE id = %s AND timestamp = %s AND mode = %s AND data_type = %s
             """
             
             self.cursor.execute(
@@ -189,6 +197,7 @@ class DatabaseHandler:
                 (
                     data['log_id'],
                     data['timestamp'],
+                    data['mode'],
                     data['type']
                 )
             )
@@ -198,28 +207,27 @@ class DatabaseHandler:
             if existing:
                 # Update existing record
                 update_query = """
-                UPDATE trading.dashboard_trades 
-                SET instrument = %s, price = %s, profit = %s
-                WHERE id = %s AND timestamp = %s AND type = %s
+                UPDATE trading.dashboard_data 
+                SET json_data = %s
+                WHERE id = %s AND timestamp = %s AND mode = %s AND data_type = %s
                 """
                 
                 self.cursor.execute(
                     update_query, 
                     (
-                        data['instrument'],
-                        data['price'],
-                        data['profit'],
+                        json_data,
                         data['log_id'],
                         data['timestamp'],
+                        data['mode'],
                         data['type']
                     )
                 )
             else:
                 # Insert new record
                 insert_query = """
-                INSERT INTO trading.dashboard_trades 
-                (id, timestamp, type, instrument, price, profit) 
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO trading.dashboard_data 
+                (id, timestamp, mode, data_type, json_data) 
+                VALUES (%s, %s, %s, %s, %s)
                 """
                 
                 self.cursor.execute(
@@ -227,10 +235,9 @@ class DatabaseHandler:
                     (
                         data['log_id'],
                         data['timestamp'],
+                        data['mode'],
                         data['type'],
-                        data['instrument'],
-                        data['price'],
-                        data['profit']
+                        json_data
                     )
                 )
             
@@ -432,9 +439,11 @@ class JSNLProcessor:
                         # Extract required fields
                         log_id = data.get('log_id')
                         timestamp = data.get('timestamp')
+                        mode = data.get('type')
+                        component = data.get('component')
                         value_obj = data.get('value', {})
                         
-                        if not log_id or not timestamp or not value_obj:
+                        if not log_id or not timestamp or not value_obj or not mode or not component:
                             missing_fields += 1
                             continue
                         
@@ -466,6 +475,8 @@ class JSNLProcessor:
                         record = {
                             'log_id': log_id,
                             'timestamp': timestamp,
+                            'mode': mode,
+                            'component': component,
                             'filename': os.path.basename(file_path),
                             'data': line.strip(),
                             'date': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d')
@@ -478,10 +489,22 @@ class JSNLProcessor:
                         if isinstance(value_obj, list):
                             # Process array of records
                             for item in value_obj:
-                                self._process_value_item(log_id, timestamp, item, equity_records_data, candles, equity_records, trade_records)
+                                equity_processed, trade_processed = self._process_value_item(
+                                    log_id, timestamp, mode, component, item, equity_records_data, candles
+                                )
+                                if equity_processed:
+                                    equity_records += 1
+                                if trade_processed:
+                                    trade_records += 1
                         else:
                             # Process single record
-                            self._process_value_item(log_id, timestamp, value_obj, equity_records_data, candles, equity_records, trade_records)
+                            equity_processed, trade_processed = self._process_value_item(
+                                log_id, timestamp, mode, component, value_obj, equity_records_data, candles
+                            )
+                            if equity_processed:
+                                equity_records += 1
+                            if trade_processed:
+                                trade_records += 1
                         
                     except json.JSONDecodeError as e:
                         invalid_records += 1
@@ -546,28 +569,34 @@ class JSNLProcessor:
             logger.error(traceback.format_exc())
             return None, set()
     
-    def _process_value_item(self, log_id, timestamp, value_item, equity_records_data, candles, equity_records_count, trade_records_count):
+    def _process_value_item(self, log_id, timestamp, mode, component, value_item, equity_records_data, candles):
         """
         Process a single value item from a JSNL record.
         
         Args:
             log_id: The log ID of the record
             timestamp: The timestamp of the record
+            mode: The mode of the record
+            component: The component of the record
             value_item: The value item to process
             equity_records_data: Dictionary to store equity records
             candles: Dictionary to store candle data
-            equity_records_count: Counter for equity records
-            trade_records_count: Counter for trade records
+            
+        Returns:
+            Tuple of (equity_record_processed, trade_record_processed) booleans
         """
         # Check if the item has a type field
         record_type = value_item.get('t')
         
         if not record_type:
             # Skip items without a type
-            return
+            return False, False
+        
+        equity_processed = False
+        trade_processed = False
         
         if record_type == 'e':  # Equity record
-            equity_records_count += 1
+            equity_processed = True
             
             # Store equity record for later processing (after we find candles)
             # Use the broker field if available, otherwise use a default
@@ -576,6 +605,8 @@ class JSNLProcessor:
             equity_records_data[(log_id, timestamp)] = {
                 'log_id': log_id,
                 'timestamp': timestamp,
+                'mode': mode,
+                'component': component,
                 'value': {
                     't': 'e',
                     'equity': value_item.get('equity', 0.0),
@@ -588,13 +619,15 @@ class JSNLProcessor:
             candles[(log_id, timestamp)] = value_item.get('candle', value_item)
             
         elif record_type in ['open', 'close', 'adjust-open', 'adjust-close']:  # Trade record
-            trade_records_count += 1
+            trade_processed = True
             
             # Extract trade data - handle both formats
             trade_data = {
                 'log_id': log_id,
                 'timestamp': timestamp,
-                'type': record_type,  # Use 'type' instead of 'trade_type'
+                'type': record_type,
+                'mode': mode,
+                'component': component,
                 'instrument': value_item.get('instrument', ''),
                 'price': value_item.get('price', 0.0),
                 'profit': value_item.get('profit', 0.0)
@@ -602,52 +635,8 @@ class JSNLProcessor:
             
             # Store in database
             self.db_handler.store_trade(trade_data)
-    
-    def create_equity_parquet(self, records: List[Dict[str, Any]], output_file: str) -> None:
-        """Create a Parquet file from equity records."""
-        # Add date column for partitioning
-        for record in records:
-            record['date'] = datetime.fromtimestamp(record['timestamp']).strftime('%Y-%m-%d')
         
-        # Convert to DataFrame
-        df = pd.DataFrame(records)
-        
-        # Create PyArrow table
-        table = pa.Table.from_pandas(df)
-        
-        # Write to Parquet with optimizations
-        pq.write_table(
-            table,
-            output_file,
-            compression='snappy',
-            use_dictionary=True,
-            write_statistics=True
-        )
-        
-        logger.info(f"Saved Parquet file with optimizations for time range and ID queries: {output_file}")
-
-    def create_trade_parquet(self, records: List[Dict[str, Any]], output_file: str) -> None:
-        """Create a Parquet file from trade records."""
-        # Add date column for partitioning
-        for record in records:
-            record['date'] = datetime.fromtimestamp(record['timestamp']).strftime('%Y-%m-%d')
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(records)
-        
-        # Create PyArrow table
-        table = pa.Table.from_pandas(df)
-        
-        # Write to Parquet with optimizations
-        pq.write_table(
-            table,
-            output_file,
-            compression='snappy',
-            use_dictionary=True,
-            write_statistics=True
-        )
-        
-        logger.info(f"Saved Parquet file with optimizations for trade data: {output_file}")
+        return equity_processed, trade_processed
     
     def create_weekly_files(self, min_timestamp: float, max_timestamp: float) -> None:
         """
