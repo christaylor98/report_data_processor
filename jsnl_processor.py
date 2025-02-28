@@ -92,17 +92,11 @@ class DatabaseHandler:
     def connect(self) -> None:
         """Connect to the database."""
         try:
-            self.conn = mysql.connector.connect(
-                host=self.config['host'],
-                port=self.config['port'],
-                user=self.config['user'],
-                password=self.config['password'],
-                database=self.config['database']
-            )
+            self.conn = mysql.connector.connect(**self.config['db_config'])
             self.cursor = self.conn.cursor()
-            logger.info(f"Connected to database {self.config['database']} on {self.config['host']}")
-        except Exception as e:
-            logger.error(f"Failed to connect to database: {str(e)}")
+            logger.info("Connected to database")
+        except mysql.connector.Error as e:
+            logger.error(f"Error connecting to database: {str(e)}")
             raise
             
     def disconnect(self) -> None:
@@ -113,33 +107,58 @@ class DatabaseHandler:
             self.conn.close()
             logger.info("Disconnected from database")
             
-    def store_equity(self, data: Dict[str, Any]) -> None:
-        """Store equity data in the database."""
+    def store_equity(self, record: Dict[str, Any]) -> None:
+        """
+        Store equity record in the database.
+        
+        Args:
+            record: Dictionary containing equity record data
+        """
         if not self.conn or not self.cursor:
             logger.error("Database connection not established")
             return
-            
+        
         try:
-            # Insert or replace equity record
+            # Extract candle data if present
+            candle_data = None
+            if 'value' in record and isinstance(record['value'], dict):
+                if 'candle' in record['value']:
+                    candle_data = json.dumps(record['value']['candle'])
+            
+            # Prepare SQL query
             query = """
-            REPLACE INTO trading.dashboard_equity 
-            (id, timestamp, mode, equity) 
-            VALUES (%s, %s, %s, %s)
+                INSERT INTO dashboard_equity 
+                (id, timestamp, mode, equity, candle) 
+                VALUES (%s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE 
+                equity = VALUES(equity),
+                candle = VALUES(candle)
             """
             
+            # Extract broker name (mode)
+            broker = record.get('value', {}).get('b', 'unknown')
+            
+            # Execute query
             self.cursor.execute(
                 query, 
                 (
-                    data['log_id'],  # Use log_id as id
-                    data['timestamp'],
-                    data.get('mode', 'live'),  # Default to 'live' if mode not provided
-                    data['equity']
+                    record['log_id'],
+                    record['timestamp'],
+                    broker,
+                    record['value'].get('equity', 0.0),
+                    candle_data
                 )
             )
             self.conn.commit()
-            logger.debug(f"Stored equity data for {data['log_id']} at {data['timestamp']}")
+            
+        except mysql.connector.Error as e:
+            logger.error(f"Error storing equity record: {str(e)}")
+            logger.error(f"Record: {record}")
+            self.conn.rollback()
         except Exception as e:
-            logger.error(f"Failed to store equity data: {str(e)}")
+            logger.error(f"Unexpected error storing equity record: {str(e)}")
+            logger.error(f"Record: {record}")
+            logger.error(traceback.format_exc())
             self.conn.rollback()
             
     def store_trade(self, data: Dict[str, Any]) -> None:
@@ -147,37 +166,69 @@ class DatabaseHandler:
         if not self.conn or not self.cursor:
             logger.error("Database connection not established")
             return
-            
+        
         try:
-            # Use log_id directly as the ID
-            trade_id = data['log_id']
+            # Log the trade data being stored
+            logger.debug(f"Storing trade data: id={data['log_id']}, timestamp={data['timestamp']}, type={data['type']}")
             
-            # Create JSON data for the trade
-            json_data = json.dumps({
-                'instrument': data['instrument'],
-                'price': data['price'],
-                'profit': data['profit']
-            })
-            
-            # Insert or replace trade record in trading.dashboard_data table
-            query = """
-            REPLACE INTO trading.dashboard_data 
-            (timestamp, id, mode, data_type, json_data) 
-            VALUES (%s, %s, %s, %s, %s)
+            # Check if a record with this timestamp, id, and type already exists
+            check_query = """
+            SELECT id FROM trading.dashboard_trades 
+            WHERE id = %s AND timestamp = %s AND type = %s
             """
             
             self.cursor.execute(
-                query, 
+                check_query, 
                 (
+                    data['log_id'],
                     data['timestamp'],
-                    trade_id,
-                    data.get('mode', 'live'),  # Default to 'live' if mode not provided
-                    data['trade_type'],  # Use trade_type as data_type
-                    json_data
+                    data['type']
                 )
             )
+            
+            existing = self.cursor.fetchone()
+            
+            if existing:
+                # Update existing record
+                update_query = """
+                UPDATE trading.dashboard_trades 
+                SET instrument = %s, price = %s, profit = %s
+                WHERE id = %s AND timestamp = %s AND type = %s
+                """
+                
+                self.cursor.execute(
+                    update_query, 
+                    (
+                        data['instrument'],
+                        data['price'],
+                        data['profit'],
+                        data['log_id'],
+                        data['timestamp'],
+                        data['type']
+                    )
+                )
+            else:
+                # Insert new record
+                insert_query = """
+                INSERT INTO trading.dashboard_trades 
+                (id, timestamp, type, instrument, price, profit) 
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """
+                
+                self.cursor.execute(
+                    insert_query, 
+                    (
+                        data['log_id'],
+                        data['timestamp'],
+                        data['type'],
+                        data['instrument'],
+                        data['price'],
+                        data['profit']
+                    )
+                )
+            
             self.conn.commit()
-            logger.debug(f"Stored trade data for {trade_id} at {data['timestamp']}")
+            logger.debug(f"Stored trade data for {data['log_id']} at {data['timestamp']}")
         except Exception as e:
             logger.error(f"Failed to store trade data: {str(e)}")
             self.conn.rollback()
@@ -215,25 +266,53 @@ class JSNLProcessor:
     
     def process_jsnl_files(self) -> List[str]:
         """
-        Process all JSNL files in the input directory.
+        Process all JSNL files in the input directory in chronological order.
         Returns a list of generated Parquet files.
         """
         jsnl_files = glob.glob(os.path.join(self.config['input_dir'], '*.jsnl'))
         if not jsnl_files:
             logger.info("No JSNL files found to process")
             return []
-            
+        
+        # Sort files by timestamp in filename
+        # Assuming filenames are in format: dashboard_data_YYYYMMDD_HHMMSS.jsnl
+        def extract_timestamp(filename):
+            try:
+                # Extract date and time parts from filename
+                base_name = os.path.basename(filename)
+                parts = base_name.split('_')
+                if len(parts) >= 4:
+                    date_part = parts[2]  # YYYYMMDD
+                    time_part = parts[3].split('.')[0]  # HHMMSS
+                    
+                    # Parse date and time
+                    if len(date_part) == 8 and len(time_part) == 6:
+                        dt_str = f"{date_part}_{time_part}"
+                        dt = datetime.strptime(dt_str, "%Y%m%d_%H%M%S")
+                        return dt.timestamp()
+                
+                # If we can't parse the timestamp, use file modification time as fallback
+                return os.path.getmtime(filename)
+            except Exception as e:
+                logger.warning(f"Could not extract timestamp from filename {filename}: {str(e)}")
+                return os.path.getmtime(filename)
+        
+        # Sort files by extracted timestamp
+        jsnl_files.sort(key=extract_timestamp)
+        logger.info(f"Sorted {len(jsnl_files)} files by timestamp in filename")
+        
         # Limit the number of files if max_files is specified
         if self.max_files is not None:
             jsnl_files = jsnl_files[:self.max_files]
             logger.info(f"Processing limited to {self.max_files} files")
-            
+        
         logger.info(f"Found {len(jsnl_files)} JSNL files to process")
         generated_files = []
         data_timestamps = set()  # Track timestamps from the data
         
         for jsnl_file in jsnl_files:
             try:
+                logger.info(f"Processing file in order: {os.path.basename(jsnl_file)}")
                 output_file, timestamps = self.process_single_file(jsnl_file)
                 if output_file:
                     generated_files.append(output_file)
@@ -248,182 +327,244 @@ class JSNLProcessor:
                 logger.error(f"Error processing file {jsnl_file}: {str(e)}")
                 logger.error(traceback.format_exc())
                 
-        # Perform merges based on data timestamps
+        # Perform weekly merge based on data timestamps
         if data_timestamps:
             min_ts = min(data_timestamps)
             max_ts = max(data_timestamps)
             logger.info(f"Data timestamps range from {datetime.fromtimestamp(min_ts)} to {datetime.fromtimestamp(max_ts)}")
             
-            # Merge files for each hour in the data range
-            self.merge_parquet_files('hourly', min_ts, max_ts)
-            
-            # Merge files for each day in the data range
-            self.merge_parquet_files('daily', min_ts, max_ts)
-            
-            # Merge files for each month in the data range
-            self.merge_parquet_files('monthly', min_ts, max_ts)
+            # Create weekly files
+            logger.info("Creating weekly Parquet files")
+            self.create_weekly_files(min_ts, max_ts)
         
         return generated_files
     
-    def process_single_file(self, jsnl_file: str) -> Tuple[Optional[str], Set[float]]:
+    def process_single_file(self, file_path: str) -> Tuple[Optional[str], Set[float]]:
         """
-        Process a single JSNL file into Parquet format.
-        Returns the path to the generated Parquet file and set of timestamps.
-        """
-        file_id = self.get_file_id(jsnl_file)
-        output_filename = self.get_output_filename(jsnl_file, file_id)
+        Process a single JSNL file and convert it to Parquet format.
         
-        # Check if file already exists (idempotent processing)
-        output_file = os.path.join(self.config['temp_dir'], output_filename)
+        Args:
+            file_path: Path to the JSNL file
+            
+        Returns:
+            Tuple of (generated Parquet file path, set of timestamps)
+        """
+        logger.info(f"Processing file {file_path}")
+        
+        # Generate a unique ID for this file based on content
+        file_id = self.get_file_id(file_path)
+        
+        # Create output filename
+        base_name = os.path.basename(file_path)
+        output_file = os.path.join(self.config['temp_dir'], f"{os.path.splitext(base_name)[0]}_{file_id}.parquet")
+        
+        # Check if file already exists (idempotent)
         if os.path.exists(output_file):
             logger.info(f"File {output_file} already exists, skipping processing")
+            
+            # Move the original file to processed directory if needed
+            if os.path.dirname(file_path) == self.config['input_dir']:
+                processed_path = os.path.join(self.config['processed_dir'], os.path.basename(file_path))
+                shutil.move(file_path, processed_path)
+                logger.info(f"Moved processed file to {processed_path}")
+            
+            # Return the existing file path and an empty set of timestamps
             return output_file, set()
         
-        logger.info(f"Processing file {jsnl_file}")
-        
-        # Initialize counters for statistics
-        total_records = 0
-        invalid_records = 0
-        missing_fields = 0
-        processed_records = 0
-        
-        # Initialize data structures for records
+        # Process the file
         records = []
         timestamps = set()
         
-        # Process each line in the file
-        with open(jsnl_file, 'r', encoding='utf-8') as f:
-            for _line_num, line in enumerate(f, 1):
-                total_records += 1
+        # Statistics
+        total_records = 0
+        invalid_records = 0
+        missing_fields = 0
+        equity_records = 0
+        trade_records = 0
+        skipped_no_candle = 0
+        
+        # Temporary storage for candles by log_id and timestamp
+        candles = {}  # Format: {(log_id, timestamp): candle_data}
+        equity_records_data = {}  # Format: {(log_id, timestamp): equity_record}
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    total_records += 1
+                    
+                    try:
+                        # Parse JSON
+                        data = json.loads(line.strip())
+                        
+                        # Extract required fields
+                        log_id = data.get('log_id')
+                        timestamp = data.get('timestamp')
+                        value_obj = data.get('value', {})
+                        
+                        if not log_id or not timestamp or not value_obj:
+                            missing_fields += 1
+                            continue
+                        
+                        # Convert timestamp to float if it's not already
+                        if isinstance(timestamp, str):
+                            timestamp = float(timestamp)
+                        
+                        # Check if this line contains a candle record
+                        has_candle = False
+                        
+                        # Handle both single objects and arrays
+                        if isinstance(value_obj, list):
+                            for item in value_obj:
+                                if item.get('t') == 'c':
+                                    has_candle = True
+                                    break
+                        else:
+                            has_candle = (value_obj.get('t') == 'c')
+                        
+                        # Skip lines without candles
+                        if not has_candle:
+                            skipped_no_candle += 1
+                            continue
+                        
+                        # Add timestamp to set for later use
+                        timestamps.add(timestamp)
+                        
+                        # Create record with common fields
+                        record = {
+                            'log_id': log_id,
+                            'timestamp': timestamp,
+                            'filename': os.path.basename(file_path),
+                            'data': line.strip(),
+                            'date': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d')
+                        }
+                        
+                        # Add to records list
+                        records.append(record)
+                        
+                        # Process by record type - handle both single objects and arrays
+                        if isinstance(value_obj, list):
+                            # Process array of records
+                            for item in value_obj:
+                                self._process_value_item(log_id, timestamp, item, equity_records_data, candles, equity_records, trade_records)
+                        else:
+                            # Process single record
+                            self._process_value_item(log_id, timestamp, value_obj, equity_records_data, candles, equity_records, trade_records)
+                        
+                    except json.JSONDecodeError as e:
+                        invalid_records += 1
+                        logger.error(f"Invalid JSON in file {file_path}: {str(e)}")
+                    except Exception as e:
+                        invalid_records += 1
+                        logger.error(f"Error processing record in file {file_path}: {str(e)}")
                 
-                try:
-                    # Parse JSON
-                    record = json.loads(line)
+                # Now process equity records with associated candles
+                for key, equity_record in equity_records_data.items():
+                    # Check if we have a candle for this equity record
+                    if key in candles:
+                        # Add candle data to the equity record
+                        equity_record['value']['candle'] = candles[key]
                     
-                    # Extract required fields
-                    log_id = record.get('log_id')
-                    timestamp = record.get('timestamp')
-                    value = record.get('value')
+                    # Store in database
+                    self.db_handler.store_equity(equity_record)
+                
+                # Log statistics
+                logger.info(f"File processing statistics for {file_path}:")
+                logger.info(f"  Total records: {total_records}")
+                logger.info(f"  Invalid records: {invalid_records}")
+                logger.info(f"  Missing required fields: {missing_fields}")
+                logger.info(f"  Skipped (no candle): {skipped_no_candle}")
+                logger.info(f"  Successfully processed: {total_records - invalid_records - missing_fields - skipped_no_candle}")
+                logger.info(f"  Equity records: {equity_records}")
+                logger.info(f"  Trade records: {trade_records}")
+                
+                # If we have valid records, save to Parquet
+                if records:
+                    # Create DataFrame
+                    df = pd.DataFrame(records)
                     
-                    # Skip records without required fields
-                    if not log_id or not timestamp or not value:
-                        missing_fields += 1
-                        continue
+                    # Convert to PyArrow Table
+                    table = pa.Table.from_pandas(df)
                     
-                    # Skip records with empty log_id
-                    if not log_id.strip():
-                        missing_fields += 1
-                        continue
+                    # Write to Parquet with optimizations
+                    pq.write_table(
+                        table, 
+                        output_file,
+                        compression='snappy',
+                        use_dictionary=True,
+                        write_statistics=True
+                    )
                     
-                    # Add timestamp to set
-                    timestamps.add(timestamp)
+                    logger.info(f"Saved Parquet file with optimizations for time range and ID queries: {output_file}")
+                    logger.info(f"Created Parquet file: {output_file} with {len(records)} records (Equity: {equity_records}, Trade: {trade_records})")
                     
-                    # Add filename to record for traceability
-                    record_data = {
-                        'log_id': log_id,
-                        'timestamp': timestamp,
-                        'filename': os.path.basename(jsnl_file),
-                        'data': json.dumps(record)  # Store the entire record as JSON string
-                    }
+                    # Move the original file to processed directory
+                    if os.path.dirname(file_path) == self.config['input_dir']:
+                        processed_path = os.path.join(self.config['processed_dir'], os.path.basename(file_path))
+                        shutil.move(file_path, processed_path)
+                        logger.info(f"Moved processed file to {processed_path}")
                     
-                    # Add to records for Parquet
-                    records.append(record_data)
-                    processed_records += 1
-                    
-                    # Process for database storage based on value type
-                    self.process_record_for_db(record)
-                    
-                except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON in file {jsnl_file}: {str(e)}")
-                    invalid_records += 1
-                except Exception as e:
-                    logger.error(f"Error processing line in {jsnl_file}: {str(e)}")
-                    invalid_records += 1
-        
-        # Log processing statistics
-        logger.info(f"File processing statistics for {jsnl_file}:")
-        logger.info(f"  Total records: {total_records}")
-        logger.info(f"  Invalid records: {invalid_records}")
-        logger.info(f"  Missing required fields: {missing_fields}")
-        logger.info(f"  Successfully processed: {processed_records}")
-        
-        # If no valid records were found, return None
-        if not records:
-            logger.warning(f"No valid records found in {jsnl_file}, no Parquet file created")
-            return None, timestamps
-        
-        # Create Parquet file
-        # Add date column for partitioning
-        for record in records:
-            record['date'] = datetime.fromtimestamp(record['timestamp']).strftime('%Y-%m-%d')
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(records)
-        
-        # Create PyArrow table
-        table = pa.Table.from_pandas(df)
-        
-        # Write to Parquet with optimizations
-        pq.write_table(
-            table,
-            output_file,
-            compression='snappy',
-            use_dictionary=True,
-            write_statistics=True
-        )
-        
-        logger.info(f"Saved Parquet file with optimizations for time range and ID queries: {output_file}")
-        logger.info(f"Created Parquet file: {output_file} with {len(records)} records")
-        
-        return output_file, timestamps
+                    return output_file, timestamps
+                else:
+                    logger.warning(f"No valid records found in {file_path}, no Parquet file created")
+                    return None, set()
+                
+        except Exception as e:
+            logger.error(f"Failed to process file {file_path}: {str(e)}")
+            logger.error(traceback.format_exc())
+            return None, set()
     
-    def process_record_for_db(self, record: Dict[str, Any]) -> None:
+    def _process_value_item(self, log_id, timestamp, value_item, equity_records_data, candles, equity_records_count, trade_records_count):
         """
-        Process a record for database storage.
-        Extracts equity and trade data and stores in the appropriate database tables.
-        """
-        log_id = record.get('log_id')
-        timestamp = record.get('timestamp')
-        value = record.get('value')
+        Process a single value item from a JSNL record.
         
-        if not log_id or not timestamp or not value:
+        Args:
+            log_id: The log ID of the record
+            timestamp: The timestamp of the record
+            value_item: The value item to process
+            equity_records_data: Dictionary to store equity records
+            candles: Dictionary to store candle data
+            equity_records_count: Counter for equity records
+            trade_records_count: Counter for trade records
+        """
+        # Check if the item has a type field
+        record_type = value_item.get('t')
+        
+        if not record_type:
+            # Skip items without a type
             return
         
-        # Process based on value type
-        if isinstance(value, dict):
-            # Single value object
-            self.process_value_object(log_id, timestamp, value)
-        elif isinstance(value, list):
-            # Multiple value objects
-            for value_obj in value:
-                if isinstance(value_obj, dict):
-                    self.process_value_object(log_id, timestamp, value_obj)
-
-    def process_value_object(self, log_id: str, timestamp: float, value_obj: Dict[str, Any]) -> None:
-        """Process a single value object for database storage."""
-        record_type = value_obj.get('t')
-        
         if record_type == 'e':  # Equity record
-            # Extract equity data
-            equity_data = {
+            equity_records_count += 1
+            
+            # Store equity record for later processing (after we find candles)
+            # Use the broker field if available, otherwise use a default
+            broker = value_item.get('b', 'unknown')
+            
+            equity_records_data[(log_id, timestamp)] = {
                 'log_id': log_id,
                 'timestamp': timestamp,
-                'broker': value_obj.get('b', ''),
-                'equity': value_obj.get('equity', 0.0)
+                'value': {
+                    't': 'e',
+                    'equity': value_item.get('equity', 0.0),
+                    'b': broker
+                }
             }
             
-            # Store in database
-            self.db_handler.store_equity(equity_data)
+        elif record_type == 'c':  # Candle record
+            # Store candle data for later association with equity records
+            candles[(log_id, timestamp)] = value_item.get('candle', value_item)
             
         elif record_type in ['open', 'close', 'adjust-open', 'adjust-close']:  # Trade record
-            # Extract trade data
+            trade_records_count += 1
+            
+            # Extract trade data - handle both formats
             trade_data = {
                 'log_id': log_id,
                 'timestamp': timestamp,
-                'trade_type': record_type,
-                'instrument': value_obj.get('instrument', ''),
-                'price': value_obj.get('price', 0.0),
-                'profit': value_obj.get('profit', 0.0)
+                'type': record_type,  # Use 'type' instead of 'trade_type'
+                'instrument': value_item.get('instrument', ''),
+                'price': value_item.get('price', 0.0),
+                'profit': value_item.get('profit', 0.0)
             }
             
             # Store in database
@@ -475,101 +616,120 @@ class JSNLProcessor:
         
         logger.info(f"Saved Parquet file with optimizations for trade data: {output_file}")
     
-    def merge_parquet_files(self, time_interval: str, min_ts: float, max_ts: float) -> None:
+    def create_weekly_files(self, min_ts: float, max_ts: float) -> None:
         """
-        Merge Parquet files based on the specified time interval and timestamp range.
-        Intervals: 'hourly', 'daily', 'monthly'
-        """
-        # Get the appropriate output directory based on the interval
-        if time_interval == 'hourly':
-            output_dir = os.path.join(self.config['output_dir'], 'hourly')
-        elif time_interval == 'daily':
-            output_dir = os.path.join(self.config['output_dir'], 'daily')
-        elif time_interval == 'monthly':
-            output_dir = os.path.join(self.config['output_dir'], 'monthly')
-        else:
-            logger.error(f"Invalid time interval: {time_interval}")
-            return
+        Create weekly Parquet files from temp files.
         
+        Args:
+            min_ts: Minimum timestamp to include
+            max_ts: Maximum timestamp to include
+        """
         # Ensure output directory exists
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Find all Parquet files in the temp directory
-        temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
-        
-        if not temp_files:
-            logger.info(f"No files found to merge for {time_interval} interval")
-            return
-        
-        # Track which files were successfully processed
-        processed_temp_files = set()
+        weekly_dir = os.path.join(self.config['output_dir'], 'weekly')
+        os.makedirs(weekly_dir, exist_ok=True)
         
         # Convert timestamps to datetime for interval calculations
         start_dt = datetime.fromtimestamp(min_ts)
         end_dt = datetime.fromtimestamp(max_ts)
         
-        # Initialize delta for all cases
-        delta = timedelta(hours=1)  # Default value
+        # Round to the start of the week (Monday)
+        start_dt = start_dt - timedelta(days=start_dt.weekday())
+        start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        if time_interval == 'hourly':
-            # For hourly, round to the start of the hour
-            start_dt = start_dt.replace(minute=0, second=0, microsecond=0)
-            delta = timedelta(hours=1)
-        elif time_interval == 'daily':
-            # For daily, round to the start of the day
-            start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-            delta = timedelta(days=1)
-        elif time_interval == 'monthly':
-            # For monthly, round to the start of the month
-            start_dt = start_dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            # For monthly, we'll use the delta in the next_dt calculation
+        # Find all temp files
+        temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
+        if not temp_files:
+            logger.info("No temp files found to merge into weekly files")
+            return
         
-        current_dt = start_dt
+        # Group files by week
+        weekly_files = {}
         
-        # Process each time period
-        while current_dt <= end_dt:
-            # Calculate the next period
-            if time_interval == 'monthly':
-                next_dt = (current_dt.replace(day=1) + timedelta(days=32)).replace(day=1)
-            else:
-                next_dt = current_dt + delta
-            
-            # Format the period for the output filename
-            period_str = current_dt.strftime('%Y%m%d_%H%M%S')
-            
+        # Read each temp file to get its timestamps
+        for temp_file in temp_files:
             try:
-                # Create the output filename
-                output_file = os.path.join(output_dir, f"{time_interval}_{period_str}.parquet")
+                # Read the Parquet file to get timestamps
+                table = pq.read_table(temp_file, columns=['timestamp'])
+                df = table.to_pandas()
                 
-                # Check if the file already exists (idempotent)
+                if df.empty:
+                    continue
+                    
+                # Group records by week
+                for ts in df['timestamp']:
+                    dt = datetime.fromtimestamp(ts)
+                    # Get the start of the week (Monday)
+                    week_start = dt - timedelta(days=dt.weekday())
+                    week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+                    
+                    # Skip if outside our range
+                    if week_start < start_dt or week_start > end_dt:
+                        continue
+                        
+                    week_key = week_start.strftime('%Y%m%d')
+                    if week_key not in weekly_files:
+                        weekly_files[week_key] = []
+                    
+                    if temp_file not in weekly_files[week_key]:
+                        weekly_files[week_key].append(temp_file)
+                    
+            except Exception as e:
+                logger.error(f"Error reading timestamps from {temp_file}: {str(e)}")
+        
+        # If no files were grouped, exit
+        if not weekly_files:
+            logger.info("No data found in the specified time range for weekly files")
+            return
+        
+        # Process each week that has files
+        processed_temp_files = set()
+        
+        for week_key, files in weekly_files.items():
+            try:
+                # Parse the week start time
+                week_start = datetime.strptime(week_key, '%Y%m%d')
+                week_end = week_start + timedelta(days=7)
+                
+                # Create the output filename
+                output_file = os.path.join(weekly_dir, f"weekly_{week_key}.parquet")
+                
+                # Check if file already exists (idempotent)
                 if os.path.exists(output_file):
-                    logger.info(f"Merged file already exists: {output_file}, skipping")
-                else:
-                    # Create a temporary table for the merged data
-                    self.conn.execute(f"""
-                        CREATE OR REPLACE TABLE merged AS
-                        SELECT * FROM parquet_scan('{os.path.join(self.config['temp_dir'], '*.parquet')}')
-                        WHERE timestamp >= '{current_dt.timestamp()}'
-                        AND timestamp < '{next_dt.timestamp()}'
-                        ORDER BY timestamp, log_id
-                    """)
-                    
-                    # Write the merged data to a Parquet file
-                    self.conn.execute(f"""
-                        COPY merged TO '{output_file}' (FORMAT 'parquet')
-                    """)
-                    
-                    logger.info(f"Created merged file for period {current_dt} to {next_dt}: {output_file}")
+                    logger.info(f"Weekly file already exists: {output_file}, skipping")
+                    continue
+                
+                # Convert the list to a proper array for DuckDB
+                files_array = "[" + ", ".join(f"'{file}'" for file in files) + "]"
+                
+                # Create a temporary table for the merged data
+                self.conn.execute(f"""
+                    CREATE OR REPLACE TABLE merged AS
+                    SELECT * FROM parquet_scan({files_array})
+                    WHERE timestamp >= {week_start.timestamp()} AND timestamp < {week_end.timestamp()}
+                    ORDER BY timestamp, log_id
+                """)
+                
+                # Check if there are any records in this period
+                result = self.conn.execute("SELECT COUNT(*) FROM merged").fetchone()
+                if result[0] == 0:
+                    logger.info(f"No records found for week {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}, skipping")
+                    continue
+                
+                # Write the merged data to a Parquet file
+                self.conn.execute(f"""
+                    COPY merged TO '{output_file}' (FORMAT 'parquet')
+                """)
+                
+                logger.info(f"Created weekly file for period {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}: {output_file}")
+                logger.info(f"Merged {len(files)} temp files")
                 
                 # Mark these files as processed
-                for file in temp_files:
+                for file in files:
                     processed_temp_files.add(file)
                 
             except Exception as e:
-                logger.error(f"Failed to merge {time_interval} files for period {current_dt}: {str(e)}")
+                logger.error(f"Failed to create weekly file for week {week_key}: {str(e)}")
                 logger.error(traceback.format_exc())
-            
-            current_dt = next_dt
         
         # After all merges complete, clean up temp files that were successfully merged
         self.cleanup_temp_files(processed_temp_files)
@@ -622,6 +782,146 @@ class JSNLProcessor:
             logger.error(f"Error during old temp file cleanup: {str(e)}")
             logger.error(traceback.format_exc())
     
+    def rollup_to_larger_interval(self, source_interval: str, target_interval: str, min_ts: float, max_ts: float) -> None:
+        """
+        Roll up files from a smaller interval to a larger interval.
+        For example, hourly to daily or daily to monthly.
+        """
+        # Get source and target directories
+        source_dir = os.path.join(self.config['output_dir'], source_interval)
+        target_dir = os.path.join(self.config['output_dir'], target_interval)
+        
+        # Ensure target directory exists
+        os.makedirs(target_dir, exist_ok=True)
+        
+        # Convert timestamps to datetime
+        start_dt = datetime.fromtimestamp(min_ts)
+        end_dt = datetime.fromtimestamp(max_ts)
+        
+        # Initialize delta for all cases
+        delta = timedelta(days=1)  # Default value
+        
+        # Set up interval parameters
+        if target_interval == 'daily':
+            # For daily, round to the start of the day
+            start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            delta = timedelta(days=1)
+            format_str = '%Y%m%d_000000'
+        elif target_interval == 'monthly':
+            # For monthly, round to the start of the month
+            start_dt = start_dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            format_str = '%Y%m01_000000'
+        else:
+            logger.error(f"Invalid target interval: {target_interval}")
+            return
+        
+        # Process each time period
+        current_dt = start_dt
+        processed_source_files = set()
+        
+        while current_dt <= end_dt:
+            # Calculate the next period
+            if target_interval == 'monthly':
+                next_dt = (current_dt.replace(day=1) + timedelta(days=32)).replace(day=1)
+            else:
+                next_dt = current_dt + delta
+            
+            # Format the period for the output filename
+            period_str = current_dt.strftime(format_str)
+            
+            try:
+                # Create the output filename
+                output_file = os.path.join(target_dir, f"{target_interval}_{period_str}.parquet")
+                
+                # Check if the file already exists (idempotent)
+                if os.path.exists(output_file):
+                    logger.info(f"Merged file already exists: {output_file}, skipping")
+                else:
+                    # Find source files that fall within this period
+                    filtered_source_files = []  # Initialize here to avoid reference before assignment
+                    
+                    if source_interval == 'hourly':
+                        source_pattern = f"{source_interval}_*.parquet"
+                        source_files = glob.glob(os.path.join(source_dir, source_pattern))
+                        
+                        # Filter files by timestamp range
+                        for file in source_files:
+                            try:
+                                # Extract date and time from filename
+                                filename = os.path.basename(file)
+                                parts = filename.split('_')
+                                if len(parts) >= 3:
+                                    dt_str = f"{parts[1]}_{parts[2].split('.')[0]}"
+                                    dt = datetime.strptime(dt_str, "%Y%m%d_%H%M%S")
+                                    if current_dt <= dt < next_dt:
+                                        filtered_source_files.append(file)
+                                        processed_source_files.add(file)
+                            except Exception as e:
+                                logger.warning(f"Could not extract timestamp from filename {file}: {str(e)}")
+                    elif source_interval == 'daily':
+                        source_pattern = f"{source_interval}_*.parquet"
+                        source_files = glob.glob(os.path.join(source_dir, source_pattern))
+                        
+                        # Filter files by timestamp range
+                        for file in source_files:
+                            try:
+                                # Extract date from filename
+                                filename = os.path.basename(file)
+                                parts = filename.split('_')
+                                if len(parts) >= 2:
+                                    dt_str = parts[1]
+                                    dt = datetime.strptime(dt_str, "%Y%m%d")
+                                    if current_dt.replace(day=1) <= dt < next_dt:
+                                        filtered_source_files.append(file)
+                                        processed_source_files.add(file)
+                            except Exception as e:
+                                logger.warning(f"Could not extract timestamp from filename {file}: {str(e)}")
+                    
+                    # If we found source files, merge them
+                    if filtered_source_files:
+                        # Convert the list to a proper array for DuckDB
+                        files_array = "[" + ", ".join(f"'{file}'" for file in filtered_source_files) + "]"
+                        
+                        # Create a temporary table for the merged data
+                        self.conn.execute(f"""
+                            CREATE OR REPLACE TABLE merged AS
+                            SELECT * FROM parquet_scan({files_array})
+                            WHERE timestamp >= {current_dt.timestamp()} AND timestamp < {next_dt.timestamp()}
+                            ORDER BY timestamp, log_id
+                        """)
+                        
+                        # Check if there are any records in this period
+                        result = self.conn.execute("SELECT COUNT(*) FROM merged").fetchone()
+                        if result[0] == 0:
+                            logger.info(f"No records found for period {current_dt} to {next_dt}, skipping")
+                            continue
+                        
+                        # Write the merged data to a Parquet file
+                        self.conn.execute(f"""
+                            COPY merged TO '{output_file}' (FORMAT 'parquet')
+                        """)
+                        
+                        logger.info(f"Created {target_interval} file for period {current_dt} to {next_dt}: {output_file}")
+                        logger.info(f"Merged {len(filtered_source_files)} {source_interval} files")
+                    else:
+                        logger.info(f"No {source_interval} files found for period {current_dt} to {next_dt}")
+                
+            except Exception as e:
+                logger.error(f"Failed to create {target_interval} file for period {current_dt}: {str(e)}")
+                logger.error(traceback.format_exc())
+            
+            current_dt = next_dt
+        
+        # Remove source files that were successfully rolled up
+        if processed_source_files:
+            logger.info(f"Removing {len(processed_source_files)} {source_interval} files that were rolled up to {target_interval}")
+            for file in processed_source_files:
+                try:
+                    os.remove(file)
+                    logger.debug(f"Removed {source_interval} file after rollup: {file}")
+                except OSError as e:
+                    logger.error(f"Failed to remove {source_interval} file {file}: {str(e)}")
+    
     def run(self) -> None:
         """Run the JSNL processing pipeline."""
         try:
@@ -632,24 +932,6 @@ class JSNLProcessor:
             generated_files = self.process_jsnl_files()
             logger.info(f"Generated {len(generated_files)} Parquet files")
             
-            # Determine which merges to perform
-            current_time = datetime.now()
-            
-            # Hourly merge (every hour)
-            if current_time.minute < self.config['processing_interval_minutes']:
-                logger.info("Performing hourly merge")
-                self.merge_parquet_files('hourly', current_time.timestamp(), current_time.timestamp())
-                
-            # Daily merge (at midnight)
-            if current_time.hour == 0 and current_time.minute < self.config['processing_interval_minutes']:
-                logger.info("Performing daily merge")
-                self.merge_parquet_files('daily', current_time.timestamp(), current_time.timestamp())
-                
-            # Monthly merge (on the 1st of each month)
-            if current_time.day == 1 and current_time.hour == 0 and current_time.minute < self.config['processing_interval_minutes']:
-                logger.info("Performing monthly merge")
-                self.merge_parquet_files('monthly', current_time.timestamp(), current_time.timestamp())
-                
             # Clean up old temp files
             self.cleanup_old_temp_files()
             
@@ -667,7 +949,6 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Process JSNL files into Parquet format.')
     parser.add_argument('--file', '-f', help='Process a single specific file')
     parser.add_argument('--limit', '-l', type=int, help='Limit processing to N files')
-    parser.add_argument('--skip-merge', action='store_true', help='Skip the merge step')
     return parser.parse_args()
 
 
@@ -697,37 +978,7 @@ def main():
                 processor.process_single_file(args.file)
         else:
             # Normal processing
-            processor.db_handler.connect()
-            processor.init_duckdb()
-            
-            # Process JSNL files
-            generated_files = processor.process_jsnl_files()
-            logger.info(f"Generated {len(generated_files)} Parquet files")
-            
-            # Skip merge if requested
-            if not args.skip_merge:
-                # Determine which merges to perform
-                current_time = datetime.now()
-                
-                # Hourly merge (every hour)
-                if current_time.minute < processor.config['processing_interval_minutes']:
-                    logger.info("Performing hourly merge")
-                    processor.merge_parquet_files('hourly', current_time.timestamp(), current_time.timestamp())
-                    
-                # Daily merge (at midnight)
-                if current_time.hour == 0 and current_time.minute < processor.config['processing_interval_minutes']:
-                    logger.info("Performing daily merge")
-                    processor.merge_parquet_files('daily', current_time.timestamp(), current_time.timestamp())
-                    
-                # Monthly merge (on the 1st of each month)
-                if current_time.day == 1 and current_time.hour == 0 and current_time.minute < processor.config['processing_interval_minutes']:
-                    logger.info("Performing monthly merge")
-                    processor.merge_parquet_files('monthly', current_time.timestamp(), current_time.timestamp())
-            else:
-                logger.info("Skipping merge step as requested")
-                
-            processor.db_handler.disconnect()
-            processor.close_duckdb()
+            processor.run()
             
         logger.info("JSNL processor completed successfully")
         return 0
