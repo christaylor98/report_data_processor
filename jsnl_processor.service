@@ -1,25 +1,25 @@
 [Unit]
 Description=JSNL to Parquet Processor
-After=network.target mariadb.service
-Wants=network.target mariadb.service
+After=network.target mysql.service
+Wants=network.target mysql.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /usr/local/bin/jsnl_processor.py
-WorkingDirectory=/usr/local/bin
-User=jsnl
-Group=jsnl
+ExecStart=/home/chris/dev/rust/report_data_processor/jsnl_processor_run.sh
+WorkingDirectory=/home/chris/dev/rust/report_data_processor
+User=chris
+Group=chris
 Restart=on-failure
 RestartSec=30s
 StartLimitIntervalSec=5m
 StartLimitBurst=3
-ExecStartPre=/bin/sh -c 'if [ "$(systemctl is-active mariadb.service)" != "active" ]; then systemctl restart mariadb.service; fi'
+# ExecStartPre=/bin/sh -c 'if [ "$(systemctl is-active mariadb.service)" != "active" ]; then systemctl restart mariadb.service; fi'
 
 # On failure after reaching start limit, trigger recovery script
-ExecStopPost=/bin/sh -c 'if [ "$SERVICE_RESULT" = "success" ]; then exit 0; fi; \
-                           if [ "$(systemctl show -p NRestarts --value jsnl_processor.service)" -ge 2 ]; then \
-                             /usr/local/bin/jsnl_recovery.sh; \
-                           fi'
+# ExecStopPost=/bin/sh -c 'if [ "$SERVICE_RESULT" = "success" ]; then exit 0; fi; \
+#                            if [ "$(systemctl show -p NRestarts --value jsnl_processor.service)" -ge 2 ]; then \
+#                              /usr/local/bin/jsnl_recovery.sh; \
+#                            fi'
 
 [Install]
 WantedBy=multi-user.target 
