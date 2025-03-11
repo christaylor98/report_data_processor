@@ -247,6 +247,53 @@ class DatabaseHandler:
             logger.error(f"Failed to store trade data: {str(e)}")
             self.conn.rollback()
 
+    def store_strand_metadata(self, strand_id: str, config: dict, name: str) -> bool:
+        """
+        Store or update strand metadata in the database.
+        
+        Args:
+            strand_id: Unique identifier for the strand
+            config: Strategy configuration dictionary
+            name: Name of the strategy
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Store config as JSON string
+            json_data = json.dumps(config)
+            
+            # Check if record exists
+            self.cursor.execute(
+                "SELECT id FROM dashboard_metadata WHERE id = %s AND component = 'strand'",
+                (strand_id,)
+            )
+            record = self.cursor.fetchone()
+            
+            if record:
+                # Update existing record
+                self.cursor.execute(
+                    "UPDATE dashboard_metadata SET name = %s, data = %s WHERE id = %s AND component = 'strand'",
+                    (name, json_data, strand_id)
+                )
+                logger.info(f"Updated existing strand metadata for strand_id: {strand_id}")
+            else:
+                # Insert new record
+                self.cursor.execute(
+                    "INSERT INTO dashboard_metadata (id, component, name, data) VALUES (%s, %s, %s, %s)",
+                    (strand_id, 'strand', name, json_data)
+                )
+                logger.info(f"Inserted new strand metadata for strand_id: {strand_id}")
+            
+            self.conn.commit()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error storing strand metadata: {str(e)}")
+            if self.conn:
+                self.conn.rollback()
+            return False
+
 
 class JSNLProcessor:
     """Process JSNL files into Parquet format."""
@@ -433,6 +480,12 @@ class JSNLProcessor:
                     total_records += 1
                     
                     try:
+                        # Process the line using process_jsnl_line for strand_started messages
+                        # This is the new code to handle strand_started messages
+                        if self.process_jsnl_line(line):
+                            # If the line was processed as a special message type, continue to next line
+                            continue
+                        
                         # Parse JSON
                         data = json.loads(line.strip())
                         
@@ -637,6 +690,53 @@ class JSNLProcessor:
             self.db_handler.store_trade(trade_data)
         
         return equity_processed, trade_processed
+    
+    def _process_strand_started(self, message: dict) -> bool:
+        """
+        Process a strand_started message.
+        
+        Args:
+            message: The parsed strand_started message
+            
+        Returns:
+            bool: True if processing succeeded, False otherwise
+        """
+        try:
+            # Extract required fields
+            strand_id = message.get('strand_id')
+            config = message.get('config', {})
+            
+            # Validate required fields
+            if not strand_id:
+                logger.error("Missing strand_id in strand_started message")
+                return False
+            
+            # Get strategy name from config
+            strategy_name = config.get('name', 'Unnamed Strategy')
+            
+            # Store metadata in database
+            return self.db_handler.store_strand_metadata(strand_id, config, strategy_name)
+            
+        except Exception as e:
+            logger.error(f"Error processing strand_started message: {str(e)}")
+            return False
+    
+    def process_jsnl_line(self, line: str) -> bool:
+        """Process a single line from the JSNL file."""
+        try:
+            message = json.loads(line)
+            message_type = message.get('type')
+            
+            if message_type == 'strand_started':
+                return self._process_strand_started(message)
+            # Process other message types...
+            
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON line: {line}")
+            return False
+        except Exception as e:
+            logger.error(f"Error processing line: {str(e)}")
+            return False
     
     def create_weekly_files(self, min_timestamp: float, max_timestamp: float) -> None:
         """

@@ -923,6 +923,152 @@ def test_skip_lines_without_candles(test_config, mock_db_handler):
     assert output_file is not None
     assert os.path.exists(output_file)
 
+def test_process_strand_started(test_config, mock_db_handler):
+    """Test processing strand_started messages."""
+    processor = JSNLProcessor(test_config)
+    processor.db_handler = mock_db_handler
+    
+    # Create test data with strand_started message
+    test_data = {
+        'type': 'strand_started',
+        'strand_id': 'test_strand_1',
+        'timestamp': '2024-02-28T12:00:00Z',
+        'config': {
+            'name': 'Test Strategy',
+            'description': 'A test strategy',
+            'tags': ['test', 'demo'],
+            'strategy_type': 'test_type',
+            'strategy_binary_key': 'test_key',
+            'trading_direction': 'long',
+            'simulated': True,
+            'live': False,
+            'feed': 'test_feed',
+            'instrument': 'TEST_USD',
+            'processor_type': 'test_processor',
+            'granularity': '1m',
+            'parameters': {
+                'param1': 'value1',
+                'param2': 'value2'
+            }
+        }
+    }
+    
+    # Mock store_strand_metadata to return True
+    mock_db_handler.store_strand_metadata = MagicMock(return_value=True)
+    
+    # Process the message directly
+    line = json.dumps(test_data)
+    result = processor.process_jsnl_line(line)
+    
+    # Verify processing was successful
+    assert result is True
+    
+    # Verify store_strand_metadata was called with correct parameters
+    mock_db_handler.store_strand_metadata.assert_called_once()
+    call_args = mock_db_handler.store_strand_metadata.call_args[0]
+    
+    # Check the arguments
+    assert call_args[0] == 'test_strand_1'  # strand_id
+    assert call_args[1] == test_data['config']  # config
+    assert call_args[2] == 'Test Strategy'  # name
+    
+    # Also test with a file
+    test_file = os.path.join(test_config['input_dir'], 'test_strand_started.jsnl')
+    
+    # Write test data to file
+    with open(test_file, 'w', encoding='utf-8') as f:
+        f.write(json.dumps(test_data) + '\n')
+    
+    # Reset the mock
+    mock_db_handler.store_strand_metadata.reset_mock()
+    
+    # Process the file
+    processor.process_single_file(test_file)
+    
+    # Verify store_strand_metadata was called again
+    mock_db_handler.store_strand_metadata.assert_called_once()
+
+def test_store_strand_metadata(test_config):
+    """Test storing strand metadata in the database."""
+    db_handler = DatabaseHandler(test_config)
+    
+    # Create mock cursor and connection
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    db_handler.conn = mock_conn
+    db_handler.cursor = mock_cursor
+    
+    # Test data
+    strand_id = 'test_strand_1'
+    config = {
+        'name': 'Test Strategy',
+        'description': 'A test strategy',
+        'parameters': {'param1': 'value1'}
+    }
+    name = 'Test Strategy'
+    
+    # Test inserting new record
+    mock_cursor.fetchone.return_value = None
+    success = db_handler.store_strand_metadata(strand_id, config, name)
+    
+    assert success is True
+    assert mock_cursor.execute.call_count == 2  # One SELECT, one INSERT
+    
+    # Test updating existing record
+    mock_cursor.reset_mock()
+    mock_cursor.fetchone.return_value = ('test_strand_1',)
+    success = db_handler.store_strand_metadata(strand_id, config, name)
+    
+    assert success is True
+    assert mock_cursor.execute.call_count == 2  # One SELECT, one UPDATE
+
+def test_process_strand_started_missing_id(test_config, mock_db_handler):
+    """Test processing strand_started message with missing strand_id."""
+    processor = JSNLProcessor(test_config)
+    processor.db_handler = mock_db_handler
+    
+    # Create message without strand_id
+    message = {
+        'type': 'strand_started',
+        'timestamp': '2024-02-28T12:00:00Z',
+        'config': {
+            'name': 'Test Strategy'
+        }
+    }
+    
+    # Process message
+    success = processor._process_strand_started(message)
+    
+    # Verify processing failed
+    assert success is False
+    
+    # Verify store_strand_metadata was not called
+    mock_db_handler.store_strand_metadata.assert_not_called()
+
+def test_process_strand_started_db_error(test_config, mock_db_handler):
+    """Test handling database errors when processing strand_started messages."""
+    processor = JSNLProcessor(test_config)
+    processor.db_handler = mock_db_handler
+    
+    # Mock store_strand_metadata to raise an exception
+    mock_db_handler.store_strand_metadata.side_effect = Exception("Database error")
+    
+    # Create test message
+    message = {
+        'type': 'strand_started',
+        'strand_id': 'test_strand_1',
+        'timestamp': '2024-02-28T12:00:00Z',
+        'config': {
+            'name': 'Test Strategy'
+        }
+    }
+    
+    # Process message
+    success = processor._process_strand_started(message)
+    
+    # Verify processing failed
+    assert success is False
+
 class TestCommandLineOptions:
     """Test cases for command line options."""
     
