@@ -183,6 +183,7 @@ class DatabaseHandler:
                 "instrument": data['instrument'],
                 "price": data['price'],
                 "profit": data['profit'],
+                "units": data['units'],
                 "t": data['type']
             })
             
@@ -799,6 +800,7 @@ class JSNLProcessor:
                 'component': component,
                 'instrument': value_item.get('instrument', ''),
                 'price': value_item.get('price', 0.0),
+                'units': value_item.get('units', 0.0),
                 'profit': value_item.get('profit', 0.0)
             }
             
