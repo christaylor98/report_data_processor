@@ -18,7 +18,9 @@ import pandas as pd
 import pyarrow.parquet as pq
 import pyarrow as pa
 
-from jsnl_processor import JSNLProcessor, DatabaseHandler, CONFIG, parse_arguments, main
+from processor import JSNLProcessor
+from db import DatabaseHandler
+from jsnl_processor import CONFIG, parse_arguments, main
 
 #pylint: disable=W1203, W0718, C0301, C0303, C0302
 
@@ -1037,7 +1039,7 @@ def test_process_strand_started_missing_id(test_config, mock_db_handler):
     }
     
     # Process message
-    success = processor._process_strand_started(message)
+    success = processor.process_strand_started(message)
     
     # Verify processing failed
     assert success is False
@@ -1064,7 +1066,7 @@ def test_process_strand_started_db_error(test_config, mock_db_handler):
     }
     
     # Process message
-    success = processor._process_strand_started(message)
+    success = processor.process_strand_started(message)
     
     # Verify processing failed
     assert success is False
