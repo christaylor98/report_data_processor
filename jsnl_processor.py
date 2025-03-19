@@ -56,7 +56,8 @@ CONFIG = {
         'hourly': 60,  # minutes
         'daily': 1440,  # minutes (24 hours)
         'monthly': 43200  # minutes (30 days)
-    }
+    },
+    'equity_on_change': False
 }
 
 # Ensure all directories exist

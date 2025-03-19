@@ -430,23 +430,24 @@ class JSNLProcessor:
         
         store_equity = False
         
-        # Check against previous equity records
-        previous_equity = self.last_equity_values.get((log_id, mode), None)
-        if (previous_equity is None) or (previous_equity != equity['value']['equity']):
-            # if previous_equity is not None:
-            #     logger.info(f"Storing equity record: {equity}, previous: {previous_equity}, current: {equity['value']['equity']}")
+        # Check if we should store equity based on configuration
+        if self.config.get('equity_on_change', True):
+            # Only store if value changed from previous
+            previous_equity = self.last_equity_values.get((log_id, mode), None)
+            if (previous_equity is None) or (previous_equity != equity['value']['equity']):
+                store_equity = True
+        else:
+            # Store every equity record
             store_equity = True
 
         # Process trade records 
         if trades:
-            store_equity = True
+            store_equity = True  # Always store equity when there are trades
             for trade in trades:
                 trade['log_id'] = log_id
                 trade['timestamp'] = timestamp
                 trade['mode'] = mode
                 trade['component'] = component
-
-                # logger.info(f"Storing trade: {trade}")
                 self.db_handler.store_trade(trade)
                 stats['trade_records'] += 1
         # Process other records
