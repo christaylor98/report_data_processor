@@ -191,10 +191,35 @@ class JSNLProcessor:
         # Reset tracking dictionaries for new file
         self.last_equity_values = {}
         
+        # Validate file and get output path
+        output_file = self._setup_file_processing(file_path)
+        if not output_file:
+            return None, set()
+        
+        # Process the file and collect records
+        records, timestamps, _ = self._process_file_contents(file_path)
+        
+        # If we have valid records, save to Parquet
+        if records:
+            return self._save_and_cleanup(file_path, output_file, records, timestamps)
+        else:
+            logger.warning(f"No valid records found in {file_path}, no Parquet file created")
+            return None, set()
+    
+    def _setup_file_processing(self, file_path: str) -> Optional[str]:
+        """
+        Set up file processing by validating the file and preparing output path.
+        
+        Args:
+            file_path: Path to the JSNL file
+            
+        Returns:
+            Output Parquet file path if setup successful, None otherwise
+        """
         # Check if file exists
         if not os.path.exists(file_path):
             logger.warning(f"File does not exist: {file_path}")
-            return None, set()
+            return None
         
         # Generate a unique ID for this file based on content
         id_start = time.time()
@@ -209,35 +234,39 @@ class JSNLProcessor:
         # Check if file already exists (idempotent)
         if os.path.exists(output_file):
             logger.info(f"File {output_file} already exists, skipping processing")
-            
-            # Move the original file to processed directory if needed
-            if os.path.dirname(file_path) == self.config['input_dir'] and os.path.exists(file_path):
-                processed_path = os.path.join(self.config['processed_dir'], os.path.basename(file_path))
-                try:
-                    shutil.move(file_path, processed_path)
-                    logger.info(f"Moved processed file to {processed_path}")
-                except (shutil.Error, OSError) as e:
-                    logger.warning(f"Could not move file {file_path} to {processed_path}: {str(e)}")
-            
-            # Return the existing file path and an empty set of timestamps
-            return output_file, set()
+            self._move_to_processed(file_path)
+            return output_file
         
-        # Process the file
+        return output_file
+    
+    def _process_file_contents(self, file_path: str) -> Tuple[List[Dict], Set[float], Dict[str, int]]:
+        """
+        Process the contents of a JSNL file.
+        
+        Args:
+            file_path: Path to the JSNL file
+            
+        Returns:
+            Tuple of (records list, timestamps set, statistics dictionary)
+        """
         records = []
         timestamps = set()
         
         # Statistics
-        total_records = 0
-        invalid_records = 0
-        missing_fields = 0
-        equity_records = 0
-        trade_records = 0
-        skipped_db_only_records = 0
-        empty_lines = 0
+        stats = {
+            'total_records': 0,
+            'invalid_records': 0,
+            'missing_fields': 0,
+            'equity_records': 0,
+            'trade_records': 0,
+            'skipped_db_only_records': 0,
+            'skipped_equity_records': 0,
+            'empty_lines': 0
+        }
         
-        # Temporary storage for candles by log_id and timestamp
-        candles = {}  # Format: {(log_id, timestamp): candle_data}
-        equity_records_data = {}  # Format: {(log_id, timestamp): equity_record}
+        # Temporary storage for candles and equity records
+        # candles = {}  # Format: {(log_id, timestamp): candle_data}
+        equity_records_data = []  # List of equity records
         
         try:
             read_start = time.time()
@@ -247,6 +276,7 @@ class JSNLProcessor:
                     logger.info(f"Processing file {file_path}, read into memory")
                     line_count = 0
                     line_process_time = 0
+                    
                     for line in iter(mm.readline, b''):
                         line_start = time.time()
                         line_count += 1
@@ -257,157 +287,24 @@ class JSNLProcessor:
                             
                             # Skip empty lines
                             if not line_str:
-                                empty_lines += 1
+                                stats['empty_lines'] += 1
                                 continue
                             
-                            # Process the line
+                            # Process the line - specifically the strand started message
                             if self.process_jsnl_line(line_str):
                                 continue
 
-                            # Parse JSON
-                            data = json.loads(line_str)
-                            total_records += 1
-                        
-                            # Extract required fields
-                            log_id = data.get('log_id')
-                            timestamp = data.get('timestamp')
-                            mode = data.get('type')
-                            component = data.get('component')
-                            value_obj = data.get('value', {})
-                            
-                            if not log_id or not timestamp or not value_obj or not mode or not component:
-                                missing_fields += 1
-                                continue
-                            
-                            # Convert timestamp to float if it's not already
-                            if isinstance(timestamp, str):
-                                timestamp = float(timestamp)
-                            
-                            # Store trading instance for this record
-                            self.db_handler.store_trading_instance(log_id, mode)
-                            
-                            # Check if this line contains a candle record
-                            has_candle = False
-                            has_equity = False
-                            has_trade = False
-                            
-                            # Handle both single objects and arrays
-                            has_other_data = False
-                            if isinstance(value_obj, list):
-                                for item in value_obj:
-                                    if item.get('t') == 'c':
-                                        has_candle = True
-                                        candles[(log_id, timestamp)] = item.get('candle', item)
-                                    elif item.get('t') == 'e':
-                                        has_equity = True
-                                        equity_records_data[(log_id, timestamp)] = {
-                                            'log_id': log_id,
-                                            'timestamp': timestamp,
-                                            'mode': mode,
-                                            'component': component,
-                                            'value': item
-                                        }
-                                        equity_records += 1
-                                    elif item.get('t') in ['open', 'close', 'adjust-open', 'adjust-close']:
-                                        has_trade = True
-                                        trade_data = {
-                                            'log_id': log_id,
-                                            'timestamp': timestamp,
-                                            'type': item.get('t'),
-                                            'mode': mode,
-                                            'component': component,
-                                            'instrument': item.get('instrument', ''),
-                                            'price': float(item.get('price', 0.0)),
-                                            'units': float(item.get('units', 0.0)),
-                                            'profit': float(item.get('profit', 0.0))
-                                        }
-                                        self.db_handler.store_trade(trade_data)
-                                        trade_records += 1
-                                    else:
-                                        has_other_data = True
-                            else:
-                                if value_obj.get('t') == 'c':
-                                    has_candle = True
-                                    candles[(log_id, timestamp)] = value_obj.get('candle', value_obj)
-                                elif value_obj.get('t') == 'e':
-                                    has_equity = True
-                                    equity_records_data[(log_id, timestamp)] = {
-                                        'log_id': log_id,
-                                        'timestamp': timestamp,
-                                        'mode': mode,
-                                        'component': component,
-                                        'value': value_obj
-                                    }
-                                    equity_records += 1
-                                elif value_obj.get('t') in ['open', 'close', 'adjust-open', 'adjust-close']:
-                                    has_trade = True
-                                    trade_data = {
-                                        'log_id': log_id,
-                                        'timestamp': timestamp,
-                                        'type': value_obj.get('t'),
-                                        'mode': mode,
-                                        'component': component,
-                                        'instrument': value_obj.get('instrument', ''),
-                                        'price': float(value_obj.get('price', 0.0)),
-                                        'units': float(value_obj.get('units', 0.0)),
-                                        'profit': float(value_obj.get('profit', 0.0))
-                                    }
-                                    self.db_handler.store_trade(trade_data)
-                                    trade_records += 1
-                                else:
-                                    has_other_data = True
-                            
-                            # Skip lines that contain ONLY candle, equity, or trade data for Parquet storage
-                            if (has_candle or has_equity or has_trade) and not has_other_data:
-                                skipped_db_only_records += 1
-                                continue
-                            
-                            # Add timestamp to set for later use
-                            timestamps.add(timestamp)
-                            
-                            # Create record with common fields
-                            record = {
-                                'log_id': log_id,
-                                'timestamp': timestamp,
-                                'mode': mode,
-                                'component': component,
-                                'filename': os.path.basename(file_path),
-                                'data': line_str,
-                                'date': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d')
-                            }
-                            
-                            # Add to records list
-                            records.append(record)
-                            
-                            # Process by record type - handle both single objects and arrays
-                            if isinstance(value_obj, list):
-                                # Process array of records
-                                for item in value_obj:
-                                    equity_processed, trade_processed = self.process_value_item(
-                                        log_id, timestamp, mode, component, item, equity_records_data, candles
-                                    )
-                                    if equity_processed:
-                                        equity_records += 1
-                                    if trade_processed:
-                                        trade_records += 1
-                            else:
-                                # Process single record
-                                equity_processed, trade_processed = self.process_value_item(
-                                    log_id, timestamp, mode, component, value_obj, equity_records_data, candles
-                                )
-                                if equity_processed:
-                                    equity_records += 1
-                                if trade_processed:
-                                    trade_records += 1
+                            # Parse and process the line
+                            self._process_single_line(line_str, records, timestamps, stats, 
+                                                   equity_records_data)
                         
                         except json.JSONDecodeError:
-                            invalid_records += 1
-                            # Only log details for first few invalid records to avoid log spam
-                            if invalid_records <= 5:
+                            stats['invalid_records'] += 1
+                            if stats['invalid_records'] <= 5:
                                 logger.warning(f"Invalid JSON at line {line_count}: {line[:100]}...")
                         except Exception as e:
-                            invalid_records += 1
-                            if invalid_records <= 5:
+                            stats['invalid_records'] += 1
+                            if stats['invalid_records'] <= 5:
                                 logger.warning(f"Error processing line {line_count}: {str(e)}")
                         
                         line_end = time.time()
@@ -416,197 +313,326 @@ class JSNLProcessor:
                         # Log progress for large files
                         if line_count % 10000 == 0:
                             logger.info(f"Processed {line_count} lines, avg time per line: {line_process_time/line_count:.6f} seconds")
-                            logger.info(f"Statistics - Valid: {total_records}, Invalid: {invalid_records}, Empty: {empty_lines}, Missing Fields: {missing_fields}")
+                            logger.info(f"Statistics - Valid: {stats['total_records']}, Invalid: {stats['invalid_records']}, "
+                                      f"Empty: {stats['empty_lines']}, Missing Fields: {stats['missing_fields']}")
+            
             read_end = time.time()
-            logger.info(f"File reading took {read_end - read_start:.2f} seconds for {total_records} records")
+            logger.info(f"File reading took {read_end - read_start:.2f} seconds for {stats['total_records']} records")
             
-            # Now process equity records with associated candles
-            db_start = time.time()
-            
-            # Prepare batch of equity records for bulk insert
-            equity_batch = []
-            for key, equity_record in equity_records_data.items():
-                # Check if we have a candle for this equity record
-                if key in candles:
-                    # Add candle data to the equity record
-                    equity_record['value']['candle'] = candles[key]
-                
-                # Add to batch
-                equity_batch.append(equity_record)
-                
-                # Process in batches of 1000 records
-                if len(equity_batch) >= 1000:
-                    self.db_handler.store_equity_batch(equity_batch)
-                    logger.info(f"Processed batch of {len(equity_batch)} equity records")
-                    equity_batch = []
-            
-            # Process any remaining records
-            if equity_batch:
-                self.db_handler.store_equity_batch(equity_batch)
-                logger.info(f"Processed final batch of {len(equity_batch)} equity records")
-            
-            db_end = time.time()
-            logger.info(f"Database operations took {db_end - db_start:.2f} seconds for {len(equity_records_data)} equity records")
+            # Process equity records with associated candles
+            self._process_equity_records(equity_records_data)
             
             # Log statistics
-            logger.info(f"File processing statistics for {file_path}:")
-            logger.info(f"  Total records: {total_records}")
-            logger.info(f"  Invalid records: {invalid_records}")
-            logger.info(f"  Missing required fields: {missing_fields}")
-            logger.info(f"  Skipped (candle/equity/trade only): {skipped_db_only_records}")
-            logger.info(f"  Successfully processed: {total_records - invalid_records - missing_fields - skipped_db_only_records}")
-            logger.info(f"  Equity records: {equity_records}")
-            logger.info(f"  Trade records: {trade_records}")
+            self._log_processing_stats(file_path, stats)
             
-            # If we have valid records, save to Parquet
-            if records:
-                parquet_start = time.time()
-                # Create DataFrame
-                df = pd.DataFrame(records)
-                
-                # Convert to PyArrow Table
-                table = pa.Table.from_pandas(df)
-                
-                # Write to Parquet with optimizations
-                pq.write_table(
-                    table, 
-                    output_file,
-                    compression='snappy',
-                    use_dictionary=True,
-                    write_statistics=True
-                )
-                parquet_end = time.time()
-                logger.info(f"Parquet file creation took {parquet_end - parquet_start:.2f} seconds")
-                
-                logger.info(f"Saved Parquet file with optimizations for time range and ID queries: {output_file}")
-                logger.info(f"Created Parquet file: {output_file} with {len(records)} records (Equity: {equity_records}, Trade: {trade_records})")
-                
-                # Move the original file to processed directory
-                if os.path.dirname(file_path) == self.config['input_dir']:
-                    processed_path = os.path.join(self.config['processed_dir'], os.path.basename(file_path))
-                    shutil.move(file_path, processed_path)
-                    logger.info(f"Moved processed file to {processed_path}")
-                
-                return output_file, timestamps
-            else:
-                logger.warning(f"No valid records found in {file_path}, no Parquet file created")
-                return None, set()
+            return records, timestamps, stats
             
         except Exception as e:
             logger.error(f"Failed to process file {file_path}: {str(e)}")
             logger.error(traceback.format_exc())
-            return None, set()
+            return [], set(), stats
     
-    def process_value_item(self, log_id, timestamp, mode, component, value_item, equity_records_data, candles):
+    def _process_single_line(self, line_str: str, records: List[Dict], timestamps: Set[float],
+                           stats: Dict[str, int], equity_records_data: List[Dict]) -> None:
+        """
+        Process a single line from the JSNL file.
+        
+        Args:
+            line_str: The line to process
+            records: List to store processed records
+            timestamps: Set to store timestamps
+            stats: Statistics dictionary
+            equity_records_data: List to store equity records
+        """
+        # Parse JSON
+        data = json.loads(line_str)
+        stats['total_records'] += 1
+    
+        # Extract required fields
+        log_id = data.get('log_id')
+        timestamp = data.get('timestamp')
+        mode = data.get('type')
+        component = data.get('component')
+        value_obj = data.get('value', {})
+        
+        if not log_id or not timestamp or not value_obj or not mode or not component:
+            stats['missing_fields'] += 1
+            return
+        
+        # Convert timestamp to float if it's not already
+        if isinstance(timestamp, str):
+            timestamp = float(timestamp)
+        
+        # Store trading instance for this record - will be skipped if already stored
+        self.db_handler.store_trading_instance(log_id, mode)
+        
+        # Process the value object
+        self._process_value_object(log_id, timestamp, mode, component, value_obj,
+                                                  equity_records_data, records, stats)
+        
+        # Skip lines that contain ONLY candle, equity, or trade data for Parquet storage
+        # if not has_other_data:
+        #     stats['skipped_db_only_records'] += 1
+        #     return
+        
+        # Add timestamp to set for later use
+        timestamps.add(timestamp)
+        
+        # Create record with common fields
+        # record = {
+        #     'log_id': log_id,
+        #     'timestamp': timestamp,
+        #     'mode': mode,
+        #     'component': component,
+        #     'filename': os.path.basename(file_path),
+        #     'data': line_str,
+        # }
+        
+        # # Add to records list
+        # records.append(record)
+    
+    def _process_value_object(self, log_id: str, timestamp: float, mode: str, component: str,
+                            value_obj: Dict, equity_records_data: List[Dict], records: List[Dict],
+                            stats: Dict[str, int]) -> bool:
+        """
+        Process a value object from a JSNL record.
+        
+        Args:
+            log_id: The log ID
+            timestamp: The timestamp
+            mode: The mode
+            component: The component
+            value_obj: The value object to process
+            equity_records_data: List to store equity records
+            records: List to store processed records
+            stats: Statistics dictionary
+            
+        Returns:
+            bool: True if the object contains other data besides candle/equity/trade
+        """
+        has_other_data = False
+        
+        candle = None
+        equity = None
+        trades = []
+        others = []
+        if isinstance(value_obj, list):
+            for item in value_obj:
+                new_candle, new_equity = self.process_value_item(item, trades, others)
+                if new_candle:
+                    candle = new_candle
+                if new_equity:
+                    equity = new_equity
+
+        # No candle or equity records, no further processing
+        if not candle or not equity:
+            return False
+        
+        store_equity = False
+        
+        # Check against previous equity records
+        previous_equity = self.last_equity_values.get((log_id, mode), None)
+        if (previous_equity is None) or (previous_equity != equity['value']['equity']):
+            # if previous_equity is not None:
+            #     logger.info(f"Storing equity record: {equity}, previous: {previous_equity}, current: {equity['value']['equity']}")
+            store_equity = True
+
+        # Process trade records 
+        if trades:
+            store_equity = True
+            for trade in trades:
+                trade['log_id'] = log_id
+                trade['timestamp'] = timestamp
+                trade['mode'] = mode
+                trade['component'] = component
+
+                # logger.info(f"Storing trade: {trade}")
+                self.db_handler.store_trade(trade)
+                stats['trade_records'] += 1
+        # Process other records
+        if others:
+            store_equity = True
+            record_data = {
+                'log_id': log_id,
+                'timestamp': timestamp,
+                'mode': mode,
+                'component': component,
+                'value': json.dumps(others)
+            }
+            records.append(record_data)
+            has_other_data = True
+        else:
+            stats['skipped_db_only_records'] += 1
+
+        # Process equity records
+        if store_equity:
+            equity['log_id'] = log_id
+            equity['timestamp'] = timestamp
+            equity['mode'] = mode
+            equity['component'] = component
+            equity['value']['candle'] = candle
+            equity_records_data.append(equity)
+            stats['equity_records'] += 1
+            self.last_equity_values[(log_id, mode)] = equity['value']['equity']
+        else:
+            stats['skipped_equity_records'] += 1
+        
+        return has_other_data
+    
+    def _process_equity_records(self, equity_records_data: List[Dict]) -> None:
+        """
+        Process equity records with associated candles.
+        
+        Args:
+            equity_records_data: List of equity records
+        """
+        db_start = time.time()
+        
+        # Prepare batch of equity records for bulk insert
+        equity_batch = []
+
+        # Break into batches of 1000 records
+        for i in range(0, len(equity_records_data), 1000):
+            end_record = min(i + 1000, len(equity_records_data)-1)
+            equity_batch = equity_records_data[i:end_record]
+            self.db_handler.store_equity_batch(equity_batch)
+            logger.info(f"Processed batch of {len(equity_batch)} equity records")
+            equity_batch = []
+
+        db_end = time.time()
+        logger.info(f"Database operations took {db_end - db_start:.2f} seconds for {len(equity_records_data)} equity records")
+    
+    def _save_and_cleanup(self, file_path: str, output_file: str, records: List[Dict],
+                         timestamps: Set[float]) -> Tuple[str, Set[float]]:
+        """
+        Save records to Parquet and clean up processed files.
+        
+        Args:
+            file_path: Original JSNL file path
+            output_file: Output Parquet file path
+            records: List of records to save
+            timestamps: Set of timestamps
+            
+        Returns:
+            Tuple of (output file path, timestamps set)
+        """
+        parquet_start = time.time()
+        # Create DataFrame
+        df = pd.DataFrame(records)
+        
+        # Convert to PyArrow Table
+        table = pa.Table.from_pandas(df)
+        
+        # Write to Parquet with optimizations
+        pq.write_table(
+            table, 
+            output_file,
+            compression='snappy',
+            use_dictionary=True,
+            write_statistics=True
+        )
+        parquet_end = time.time()
+        logger.info(f"Parquet file creation took {parquet_end - parquet_start:.2f} seconds")
+        
+        logger.info(f"Saved Parquet file with optimizations for time range and ID queries: {output_file}")
+        logger.info(f"Created Parquet file: {output_file} with {len(records)} records")
+        
+        # Move the original file to processed directory
+        self._move_to_processed(file_path)
+        
+        return output_file, timestamps
+    
+    def _move_to_processed(self, file_path: str) -> None:
+        """
+        Move a processed file to the processed directory.
+        
+        Args:
+            file_path: Path to the file to move
+        """
+        if os.path.dirname(file_path) == self.config['input_dir'] and os.path.exists(file_path):
+            processed_path = os.path.join(self.config['processed_dir'], os.path.basename(file_path))
+            try:
+                shutil.move(file_path, processed_path)
+                logger.info(f"Moved processed file to {processed_path}")
+            except (shutil.Error, OSError) as e:
+                logger.warning(f"Could not move file {file_path} to {processed_path}: {str(e)}")
+    
+    def _log_processing_stats(self, file_path: str, stats: Dict[str, int]) -> None:
+        """
+        Log processing statistics for a file.
+        
+        Args:
+            file_path: Path to the processed file
+            stats: Statistics dictionary
+        """
+        logger.info(f"File processing statistics for {file_path}:")
+        logger.info(f"  Total records: {stats['total_records']}")
+        logger.info(f"  Invalid records: {stats['invalid_records']}")
+        logger.info(f"  Missing required fields: {stats['missing_fields']}")
+        logger.info(f"  Skipped (candle/equity/trade only): {stats['skipped_db_only_records']}")
+        logger.info(f"  Skipped equity records: {stats['skipped_equity_records']}")
+        logger.info(f"  Successfully processed: {stats['total_records'] - stats['invalid_records'] - stats['missing_fields'] - stats['skipped_db_only_records']}")
+        logger.info(f"  Equity records: {stats['equity_records']}")
+        logger.info(f"  Trade records: {stats['trade_records']}")
+    
+    def process_value_item(self, value_item, trades, others):
         """
         Process a single value item from a JSNL record.
         
         Args:
-            log_id: The log ID of the record
-            timestamp: The timestamp of the record
-            mode: The mode of the record
-            component: The component of the record
             value_item: The value item to process
-            equity_records_data: Dictionary to store equity records
-            candles: Dictionary to store candle data
-            
+            trades: List to store trade records
+            others: List to store other records
+            stats: Statistics dictionary
         Returns:
-            Tuple of (equity_record_processed, trade_record_processed) booleans
+            Tuple of (candle, equity)
         """
         # Check if the item has a type field
         record_type = value_item.get('t')
         
         if not record_type:
             # Skip items without a type
-            return False, False
-        
-        equity_processed = False
-        trade_processed = False
+            return  None, None
 
-        # Store the trading instance for any valid record type
-        self.db_handler.store_trading_instance(log_id, mode)
-        
         if record_type == 'e':  # Equity record
             try:
                 # Get current equity value and ensure it's a float
                 current_equity = float(value_item.get('equity', 0.0))
-                key = (log_id, mode)
+                broker = value_item.get('b', 'unknown')
                 
-                # Get previous equity value
-                previous_equity = self.last_equity_values.get(key, None)
-                
-                # Update last equity value
-                self.last_equity_values[key] = current_equity
-                
-                # Only process equity if it's the first record or value has changed
-                if previous_equity is None or (float(current_equity) != float(previous_equity)):
-                    equity_processed = True
-                    
-                    # Store equity record for later processing (after we find candles)
-                    # Use the broker field if available, otherwise use a default
-                    broker = value_item.get('b', 'unknown')
-                    
-                    equity_records_data[(log_id, timestamp)] = {
-                        'log_id': log_id,
-                        'timestamp': timestamp,
-                        'mode': mode,
-                        'component': component,
-                        'value': {
-                            't': 'e',
-                            'equity': current_equity,
-                            'b': broker
-                        }
+                new_equity_record = {
+                    'value': {
+                        't': 'e',
+                        'equity': current_equity,
+                        'b': broker
                     }
+                }
+
+                return None, new_equity_record
             except (ValueError, TypeError) as e:
                 logger.warning(f"Invalid equity value in record: {value_item.get('equity')} - {str(e)}")
-                return False, False
+                return None, None
             
         elif record_type == 'c':  # Candle record
-            # Store candle data for later association with equity records
-            candles[(log_id, timestamp)] = value_item.get('candle', value_item)
+            candle = value_item.get('candle', None)
+            return  candle, None
         
         elif record_type in ['open', 'close', 'adjust-open', 'adjust-close']:  # Trade record
-            trade_processed = True
             
-            # When we find a trade, also store the current equity if available
-            key = (log_id, mode)
-            if key in self.last_equity_values:
-                try:
-                    current_equity = float(self.last_equity_values[key])
-                    broker = value_item.get('b', 'unknown')
-                    
-                    equity_records_data[(log_id, timestamp)] = {
-                        'log_id': log_id,
-                        'timestamp': timestamp,
-                        'mode': mode,
-                        'component': component,
-                        'value': {
-                            't': 'e',
-                            'equity': current_equity,
-                            'b': broker
-                        }
-                    }
-                    equity_processed = True
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Invalid equity value in trade record: {self.last_equity_values[key]} - {str(e)}")
-            
-            # Extract trade data - handle both formats
             trade_data = {
-                'log_id': log_id,
-                'timestamp': timestamp,
                 'type': record_type,
-                'mode': mode,
-                'component': component,
                 'instrument': value_item.get('instrument', ''),
                 'price': float(value_item.get('price', 0.0)),
                 'units': float(value_item.get('units', 0.0)),
                 'profit': float(value_item.get('profit', 0.0))
             }
-            
-            # Store in database
-            self.db_handler.store_trade(trade_data)
+
+            trades.append(trade_data)
+            return None, None
         
-        return equity_processed, trade_processed
+        else:
+            others.append(value_item)
+            return None, None
     
     def process_strand_started(self, message: dict) -> bool:
         """
@@ -652,7 +678,6 @@ class JSNLProcessor:
             
             if message_type == 'strand_started':
                 return self.process_strand_started(message)
-            # Process other message types...
             
         except json.JSONDecodeError:
             logger.error(f"Invalid JSON line: {line}")

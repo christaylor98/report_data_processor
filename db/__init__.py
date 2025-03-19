@@ -323,7 +323,7 @@ class DatabaseHandler:
         """Store trade data in the database."""
         try:
             # Log the trade data being stored
-            logger.debug(f"Storing trade data: id={data['log_id']}, timestamp={data['timestamp']}, type={data['type']}")
+            # logger.info(f"Storing trade data: id={data['log_id']}, timestamp={data['timestamp']}, type={data['type']}")
             
             # Create JSON data for the dashboard_data table
             json_data = json.dumps({
