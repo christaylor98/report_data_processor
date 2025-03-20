@@ -421,6 +421,12 @@ class JSNLProcessor:
                 new_candle, new_equity = self.process_value_item(item, trades, others)
                 if new_candle:
                     candle = new_candle
+                    # Append to other records
+                    new_candle_record = {
+                        't': 'c',
+                        'candle': new_candle
+                    }
+                    others.append(new_candle_record)
                 if new_equity:
                     equity = new_equity
 
