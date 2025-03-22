@@ -695,7 +695,7 @@ class JSNLProcessor:
     
     def create_weekly_files(self, min_timestamp: float, max_timestamp: float) -> None:
         """
-        Create weekly Parquet files from temp files.
+        Create weekly Parquet files from temp files, organized by ID.
         
         Args:
             min_timestamp: Minimum timestamp in the data
@@ -717,100 +717,117 @@ class JSNLProcessor:
         
         logger.info(f"Processing weeks from {start_of_week} to {end_of_week}")
         
-        # Create weekly files
-        current_week = start_of_week
-        while current_week < end_of_week:
-            week_start_time = time.time()
-            next_week = current_week + timedelta(days=7)
+        # Find all temp files
+        temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
+        
+        # First, group files by log_id
+        id_groups = {}
+        
+        # Read each temp file to get unique log_ids
+        for temp_file in temp_files:
+            try:
+                table = pq.read_table(temp_file, columns=['log_id'])
+                df = table.to_pandas()
+                unique_ids = df['log_id'].unique()
+                
+                # Add file to each ID's group
+                for log_id in unique_ids:
+                    if log_id not in id_groups:
+                        id_groups[log_id] = []
+                    id_groups[log_id].append(temp_file)
+                
+            except Exception as e:
+                logger.error(f"Error reading temp file {temp_file}: {str(e)}")
+        
+        logger.info(f"Found {len(id_groups)} unique log IDs")
+        
+        # Process each ID separately
+        for log_id, id_temp_files in id_groups.items():
+            logger.info(f"Processing files for log_id: {log_id}")
             
-            logger.info(f"Processing week: {current_week} to {next_week}")
-            
-            # Create weekly file name
-            weekly_file = os.path.join(
-                self.config['output_dir'], 
-                'weekly', 
-                f"weekly_{current_week.strftime('%Y%m%d')}.parquet"
-            )
-            
-            # Ensure the directory exists
-            os.makedirs(os.path.dirname(weekly_file), exist_ok=True)
-            
-            # Find temp files in this date range
-            find_start = time.time()
-            temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
-            find_end = time.time()
-            logger.info(f"Found {len(temp_files)} temp files in {find_end - find_start:.2f} seconds")
-            
-            # Filter files by timestamp range
-            filter_start = time.time()
-            filtered_temp_files = []
-            week_start_ts = current_week.timestamp()
-            week_end_ts = next_week.timestamp()
-            
-            for temp_file in temp_files:
-                try:
-                    # Read the Parquet file to get timestamps
-                    table = pq.read_table(temp_file, columns=['timestamp'])
-                    df = table.to_pandas()
-                    
-                    # Check if any timestamps fall within this week
-                    if not df.empty:
-                        min_file_ts = df['timestamp'].min()
-                        max_file_ts = df['timestamp'].max()
+            # Create weekly files for this ID
+            current_week = start_of_week
+            while current_week < end_of_week:
+                week_start_time = time.time()
+                next_week = current_week + timedelta(days=7)
+                
+                logger.info(f"Processing week for {log_id}: {current_week} to {next_week}")
+                
+                # Create ID-specific weekly file path
+                weekly_file = os.path.join(
+                    self.config['output_dir'],
+                    str(log_id),  # Create subdirectory for this ID
+                    'weekly',
+                    f"weekly_{current_week.strftime('%Y%m%d')}.parquet"
+                )
+                
+                # Ensure the directory exists
+                os.makedirs(os.path.dirname(weekly_file), exist_ok=True)
+                
+                # Filter files by timestamp range for this week
+                week_start_ts = current_week.timestamp()
+                week_end_ts = next_week.timestamp()
+                
+                filtered_temp_files = []
+                for temp_file in id_temp_files:
+                    try:
+                        # Read the Parquet file
+                        table = pq.read_table(temp_file, columns=['timestamp', 'log_id'])
+                        df = table.to_pandas()
                         
-                        # If file's timestamp range overlaps with current week
-                        if (min_file_ts < week_end_ts and max_file_ts >= week_start_ts):
+                        # Filter for this ID and timestamp range
+                        df = df[
+                            (df['log_id'] == log_id) & 
+                            (df['timestamp'] >= week_start_ts) & 
+                            (df['timestamp'] < week_end_ts)
+                        ]
+                        
+                        if not df.empty:
                             filtered_temp_files.append(temp_file)
-                            logger.debug(f"File {temp_file} contains data for current week "
-                                       f"(file range: {datetime.fromtimestamp(min_file_ts)} "
-                                       f"to {datetime.fromtimestamp(max_file_ts)})")
+                            
+                    except Exception as e:
+                        logger.error(f"Error reading temp file {temp_file}: {str(e)}")
                 
-                except Exception as e:
-                    logger.error(f"Error reading temp file {temp_file}: {str(e)}")
-            
-            filter_end = time.time()
-            logger.info(f"Filtered to {len(filtered_temp_files)} relevant files in {filter_end - filter_start:.2f} seconds")
-            
-            # If we found temp files, merge them
-            if filtered_temp_files:
-                try:
-                    merge_start = time.time()
-                    # Create a DuckDB query to merge the files
-                    files_array = "[" + ", ".join(f"'{file}'" for file in filtered_temp_files) + "]"
-                    
-                    # Create a temporary table for the merged data
-                    self.conn.execute(f"""
-                        CREATE OR REPLACE TABLE merged AS
-                        SELECT * FROM parquet_scan({files_array})
-                        WHERE timestamp >= {week_start_ts} AND timestamp < {week_end_ts}
-                        ORDER BY timestamp, log_id
-                    """)
-                    
-                    # Check if there are any records in this period
-                    result = self.conn.execute("SELECT COUNT(*) FROM merged").fetchone()
-                    record_count = result[0] if result else 0
-                    
-                    if record_count == 0:
-                        logger.info(f"No records found for period {current_week} to {next_week}, skipping")
-                    else:
-                        # Write the merged data to a Parquet file
+                # If we found relevant temp files, merge them
+                if filtered_temp_files:
+                    try:
+                        merge_start = time.time()
+                        # Create a DuckDB query to merge the files
+                        files_array = "[" + ", ".join(f"'{file}'" for file in filtered_temp_files) + "]"
+                        
+                        # Create a temporary table for the merged data
                         self.conn.execute(f"""
-                            COPY merged TO '{weekly_file}' (FORMAT 'parquet')
+                            CREATE OR REPLACE TABLE merged AS
+                            SELECT * FROM parquet_scan({files_array})
+                            WHERE timestamp >= {week_start_ts} 
+                            AND timestamp < {week_end_ts}
+                            AND log_id = '{log_id}'
+                            ORDER BY timestamp
                         """)
-                        merge_end = time.time()
-                        logger.info(f"Merged {record_count} records into weekly file in {merge_end - merge_start:.2f} seconds: {weekly_file}")
+                        
+                        # Check if there are any records in this period
+                        result = self.conn.execute("SELECT COUNT(*) FROM merged").fetchone()
+                        record_count = result[0] if result else 0
+                        
+                        if record_count > 0:
+                            # Write the merged data to a Parquet file
+                            self.conn.execute(f"""
+                                COPY merged TO '{weekly_file}' (FORMAT 'parquet')
+                            """)
+                            merge_end = time.time()
+                            logger.info(f"Merged {record_count} records into weekly file for {log_id} in {merge_end - merge_start:.2f} seconds: {weekly_file}")
+                        else:
+                            logger.info(f"No records found for {log_id} in period {current_week} to {next_week}, skipping")
+                    
+                    except Exception as e:
+                        logger.error(f"Failed to create weekly file for {log_id} period {current_week}: {str(e)}")
+                        logger.error(traceback.format_exc())
                 
-                except Exception as e:
-                    logger.error(f"Failed to create weekly file for period {current_week}: {str(e)}")
-                    logger.error(traceback.format_exc())
-            else:
-                logger.info(f"No temp files found for period {current_week} to {next_week}")
-            
-            week_end_time = time.time()
-            logger.info(f"Processing week {current_week} to {next_week} took {week_end_time - week_start_time:.2f} seconds")
-            
-            # Move to next week
-            current_week = next_week
+                week_end_time = time.time()
+                logger.info(f"Processing week {current_week} to {next_week} for {log_id} took {week_end_time - week_start_time:.2f} seconds")
+                
+                # Move to next week
+                current_week = next_week
     
     def sort_files_by_timestamp(self, jsnl_files: List[str]) -> List[str]:
         """
