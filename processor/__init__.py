@@ -351,7 +351,7 @@ class JSNLProcessor:
         # Extract required fields
         log_id = data.get('log_id')
         timestamp = data.get('timestamp')
-        mode = data.get('type')
+        mode = data.get('mode')
         component = data.get('component')
         value_obj = data.get('value', {})
         
@@ -364,7 +364,7 @@ class JSNLProcessor:
             timestamp = float(timestamp)
         
         # Store trading instance for this record - will be skipped if already stored
-        self.db_handler.store_trading_instance(log_id, mode)
+        # self.db_handler.store_trading_instance(log_id, mode)
         
         # Process the value object
         self._process_value_object(log_id, timestamp, mode, component, value_obj,
@@ -654,6 +654,7 @@ class JSNLProcessor:
         try:
             # Extract required fields
             strand_id = message.get('strand_id')
+            mode = message.get('mode', 'unknown')
             config = message.get('config', {})
             
             # Validate required fields
@@ -666,7 +667,10 @@ class JSNLProcessor:
             
             logger.info(f"Processing strand_started message: {strand_id}, {config}, {strategy_name}")
             # Store metadata in database
-            return self.db_handler.store_strand_metadata(strand_id, config, strategy_name)
+            self.db_handler.store_strand_metadata(strand_id, config, strategy_name)
+            self.db_handler.store_trading_instance(strand_id, mode, config)
+
+            return True
             
         except Exception as e:
             logger.error(f"Error processing strand_started message: {str(e)}")
@@ -877,6 +881,9 @@ class JSNLProcessor:
             # Process JSNL files
             generated_files = self.process_jsnl_files()
             logger.info(f"Generated {len(generated_files)} Parquet files")
+            
+            # Clean up old temp files
+            self.cleanup_old_temp_files()
             
             logger.info("JSNL processor completed successfully")
             

@@ -437,7 +437,7 @@ class DatabaseHandler:
             logger.error(f"Error storing strand metadata: {str(e)}")
             return False
 
-    def store_trading_instance(self, instance_id: str, mode: str) -> bool:
+    def store_trading_instance(self, instance_id: str, mode: str, config: dict) -> bool:
         """
         Store a trading instance in the database if it doesn't exist.
         
@@ -454,10 +454,15 @@ class DatabaseHandler:
             if instance_key in self.known_instances:
                 return True
             
+            # Prepare data JSON if we have config
+            data_json = None
+            if config:
+                data_json = json.dumps({'config': config})
+            
             # New instance found, add to database
             self.execute_write_query_with_retries(
-                "INSERT IGNORE INTO trading_instances (id, mode) VALUES (%s, %s)",
-                (instance_id, mode)
+                "INSERT IGNORE INTO trading_instances (id, mode, data) VALUES (%s, %s, %s)",
+                (instance_id, mode, data_json)
             )
             
             # Add to known instances set
