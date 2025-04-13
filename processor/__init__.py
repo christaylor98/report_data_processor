@@ -54,6 +54,9 @@ class JSNLProcessor:
         # Track last equity value for each (log_id, mode) pair
         self.last_equity_values = {}  # Format: {(log_id, mode): last_equity_value}
         
+        # Track all equity records for final merge
+        self.all_equity_records = []
+        
     def init_duckdb(self) -> None:
         """Initialize DuckDB connection."""
         self.conn = duckdb.connect(':memory:')
@@ -495,17 +498,9 @@ class JSNLProcessor:
         """
         db_start = time.time()
         
-        # Prepare batch of equity records for bulk insert
-        equity_batch = []
-
-        # Break into batches of 1000 records
-        for i in range(0, len(equity_records_data), 1000):
-            end_record = min(i + 1000, len(equity_records_data)-1)
-            equity_batch = equity_records_data[i:end_record]
-            self.db_handler.store_equity_batch(equity_batch)
-            logger.info(f"Processed batch of {len(equity_batch)} equity records")
-            equity_batch = []
-
+        # Store records in temporary table
+        self.db_handler.store_equity_batch(equity_records_data)
+        
         db_end = time.time()
         logger.info(f"Database operations took {db_end - db_start:.2f} seconds for {len(equity_records_data)} equity records")
     
@@ -668,7 +663,7 @@ class JSNLProcessor:
             logger.info(f"Processing strand_started message: {strand_id}, {config}, {strategy_name}")
             # Store metadata in database
             self.db_handler.store_strand_metadata(strand_id, config, strategy_name)
-            self.db_handler.store_trading_instance(strand_id, mode, config)
+            self.db_handler.store_trading_instance(strand_id, mode, "strand", config)
 
             return True
             
@@ -773,6 +768,8 @@ class JSNLProcessor:
                 week_end_ts = next_week.timestamp()
                 
                 filtered_temp_files = []
+                has_new_data = False
+                
                 for temp_file in id_temp_files:
                     try:
                         # Read the Parquet file
@@ -788,12 +785,13 @@ class JSNLProcessor:
                         
                         if not df.empty:
                             filtered_temp_files.append(temp_file)
+                            has_new_data = True
                             
                     except Exception as e:
                         logger.error(f"Error reading temp file {temp_file}: {str(e)}")
                 
-                # If we found relevant temp files, merge them
-                if filtered_temp_files:
+                # Only process if we have new data
+                if has_new_data:
                     try:
                         merge_start = time.time()
                         # Create a DuckDB query to merge the files
@@ -826,6 +824,8 @@ class JSNLProcessor:
                     except Exception as e:
                         logger.error(f"Failed to create weekly file for {log_id} period {current_week}: {str(e)}")
                         logger.error(traceback.format_exc())
+                else:
+                    logger.info(f"No new data for {log_id} in period {current_week} to {next_week}, skipping")
                 
                 week_end_time = time.time()
                 logger.info(f"Processing week {current_week} to {next_week} for {log_id} took {week_end_time - week_start_time:.2f} seconds")
@@ -882,6 +882,13 @@ class JSNLProcessor:
             generated_files = self.process_jsnl_files()
             logger.info(f"Generated {len(generated_files)} Parquet files")
             
+            # Merge all equity records into the main table
+            logger.info("Merging equity records into main table")
+            merge_start = time.time()
+            self.db_handler.merge_temp_equity_records()
+            merge_end = time.time()
+            logger.info(f"Equity records merge took {merge_end - merge_start:.2f} seconds")
+            
             # Clean up old temp files
             self.cleanup_old_temp_files()
             
@@ -890,13 +897,18 @@ class JSNLProcessor:
         except Exception as e:
             logger.error(f"Error in JSNL processor: {str(e)}")
             logger.error(traceback.format_exc())
-
+        finally:
+            # Clean up database connections
+            if self.db_handler:
+                self.db_handler.drop_pool()
+            if self.conn:
+                self.close_duckdb()
+                
     def cleanup_old_temp_files(self) -> None:
         """
-        Clean up old temporary Parquet files that are no longer needed.
-        
-        This method removes temporary files that are older than a certain threshold
-        and have already been merged into weekly files.
+        Clean up all temporary Parquet files at the end of a run.
+
+        This method removes all temporary files in the temp directory.
         """
         try:
             # Get all temp files
@@ -906,31 +918,19 @@ class JSNLProcessor:
                 logger.info("No temporary files to clean up")
                 return
             
-            # Get current time
-            now = datetime.now()
-            
-            # Define threshold for old files (default: 7 days)
-            threshold_days = 7
-            threshold = now - timedelta(days=threshold_days)
-            
             # Count of removed files
             removed_count = 0
             
-            # Check each file
+            # Remove each file
             for temp_file in temp_files:
                 try:
-                    # Get file modification time
-                    mod_time = datetime.fromtimestamp(os.path.getmtime(temp_file))
-                    
-                    # If file is older than threshold, remove it
-                    if mod_time < threshold:
-                        os.remove(temp_file)
-                        logger.info(f"Removed old temp file: {temp_file}")
-                        removed_count += 1
+                    os.remove(temp_file)
+                    logger.info(f"Removed temp file: {temp_file}")
+                    removed_count += 1
                 except OSError as e:
-                    logger.error(f"Failed to check or remove temp file {temp_file}: {str(e)}")
+                    logger.error(f"Failed to remove temp file {temp_file}: {str(e)}")
             
-            logger.info(f"Cleaned up {removed_count} old temporary files")
+            logger.info(f"Cleaned up {removed_count} temporary files")
         except Exception as e:
-            logger.error(f"Error cleaning up old temp files: {str(e)}")
+            logger.error(f"Error cleaning up temp files: {str(e)}")
             logger.error(traceback.format_exc())
