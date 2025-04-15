@@ -118,7 +118,6 @@ class DatabaseHandler:
                     timestamp double NOT NULL,
                     mode varchar(255) NOT NULL,
                     equity double NOT NULL,
-                    candle varchar(700) DEFAULT NULL,
                     PRIMARY KEY (id, timestamp, mode)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
             """
@@ -150,27 +149,20 @@ class DatabaseHandler:
                 # Prepare SQL query for temporary table
                 query = f"""
                     INSERT INTO {self.temp_equity_table}
-                    (id, timestamp, mode, equity, candle) 
-                    VALUES (%s, %s, %s, %s, %s)
+                    (id, timestamp, mode, equity) 
+                    VALUES (%s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE 
-                    equity = VALUES(equity),
-                    candle = VALUES(candle)
+                    equity = VALUES(equity)
                 """
                 
                 # Prepare batch data for this chunk
                 batch_data = []
                 for record in chunk:
-                    candle_data = None
-                    if 'value' in record and isinstance(record['value'], dict):
-                        if 'candle' in record['value']:
-                            candle_data = json.dumps(record['value']['candle'])
-                    
                     batch_data.append((
                         record['log_id'],
                         record['timestamp'],
                         record['mode'],
-                        record['value'].get('equity', 0.0),
-                        candle_data
+                        record['value'].get('equity', 0.0)
                     ))
                 
                 # Use retry mechanism for each chunk
@@ -239,8 +231,7 @@ class DatabaseHandler:
                         SELECT * FROM {self.temp_equity_table}
                         LIMIT {chunk_size} OFFSET {processed_records}
                         ON DUPLICATE KEY UPDATE 
-                        equity = VALUES(equity),
-                        candle = VALUES(candle)
+                        equity = VALUES(equity)
                     """
                     cursor.execute(merge_query)
                     self.conn.commit()
@@ -485,20 +476,13 @@ class DatabaseHandler:
             record: Dictionary containing equity record data
         """        
         try:
-            # Extract candle data if present
-            candle_data = None
-            if 'value' in record and isinstance(record['value'], dict):
-                if 'candle' in record['value']:
-                    candle_data = json.dumps(record['value']['candle'])
-            
             # Prepare SQL query
             query = """
                 INSERT INTO dashboard_equity 
-                (id, timestamp, mode, equity, candle) 
-                VALUES (%s, %s, %s, %s, %s)
+                (id, timestamp, mode, equity) 
+                VALUES (%s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE 
-                equity = VALUES(equity),
-                candle = VALUES(candle)
+                equity = VALUES(equity)
             """
             
             # Extract broker name (mode)
@@ -511,8 +495,7 @@ class DatabaseHandler:
                     record['log_id'],
                     record['timestamp'],
                     record['mode'],
-                    record['value'].get('equity', 0.0),
-                    candle_data
+                    record['value'].get('equity', 0.0)
                 )
             )
         except mariadb.Error as e:

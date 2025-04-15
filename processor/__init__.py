@@ -411,30 +411,21 @@ class JSNLProcessor:
             stats: Statistics dictionary
             
         Returns:
-            bool: True if the object contains other data besides candle/equity/trade
+            bool: True if the object contains other data besides equity/trade
         """
         has_other_data = False
         
-        candle = None
         equity = None
         trades = []
         others = []
         if isinstance(value_obj, list):
             for item in value_obj:
-                new_candle, new_equity = self.process_value_item(item, trades, others)
-                if new_candle:
-                    candle = new_candle
-                    # Append to other records
-                    new_candle_record = {
-                        't': 'c',
-                        'candle': new_candle
-                    }
-                    others.append(new_candle_record)
+                new_equity = self.process_value_item(item, trades, others)
                 if new_equity:
                     equity = new_equity
 
-        # No candle or equity records, no further processing
-        if not candle or not equity:
+        # No equity records, no further processing
+        if not equity:
             return False
         
         store_equity = False
@@ -451,7 +442,7 @@ class JSNLProcessor:
 
         # Process trade records 
         if trades:
-            store_equity = True  # Always store equity when there are trades
+            # store_equity = True  # Always store equity when there are trades
             for trade in trades:
                 trade['log_id'] = log_id
                 trade['timestamp'] = timestamp
@@ -461,7 +452,7 @@ class JSNLProcessor:
                 stats['trade_records'] += 1
         # Process other records
         if others:
-            store_equity = True
+            # store_equity = True
             record_data = {
                 'log_id': log_id,
                 'timestamp': timestamp,
@@ -480,7 +471,6 @@ class JSNLProcessor:
             equity['timestamp'] = timestamp
             equity['mode'] = mode
             equity['component'] = component
-            equity['value']['candle'] = candle
             equity_records_data.append(equity)
             stats['equity_records'] += 1
             self.last_equity_values[(log_id, mode)] = equity['value']['equity']
@@ -585,16 +575,15 @@ class JSNLProcessor:
             value_item: The value item to process
             trades: List to store trade records
             others: List to store other records
-            stats: Statistics dictionary
         Returns:
-            Tuple of (candle, equity)
+            equity record or None
         """
         # Check if the item has a type field
         record_type = value_item.get('t')
         
         if not record_type:
             # Skip items without a type
-            return  None, None
+            return None
 
         if record_type == 'e':  # Equity record
             try:
@@ -610,17 +599,17 @@ class JSNLProcessor:
                     }
                 }
 
-                return None, new_equity_record
+                return new_equity_record
             except (ValueError, TypeError) as e:
                 logger.warning(f"Invalid equity value in record: {value_item.get('equity')} - {str(e)}")
-                return None, None
+                return None
             
         elif record_type == 'c':  # Candle record
-            candle = value_item.get('candle', None)
-            return  candle, None
+            # Just add to others list
+            others.append(value_item)
+            return None
         
         elif record_type in ['open', 'close', 'adjust-open', 'adjust-close']:  # Trade record
-            
             trade_data = {
                 'type': record_type,
                 'instrument': value_item.get('instrument', ''),
@@ -630,11 +619,11 @@ class JSNLProcessor:
             }
 
             trades.append(trade_data)
-            return None, None
+            return None
         
         else:
             others.append(value_item)
-            return None, None
+            return None
     
     def process_strand_started(self, message: dict) -> bool:
         """
