@@ -7,12 +7,18 @@ import os
 import time
 import logging
 import json
+import hashlib
 from typing import Dict, Any, List
 import traceback
 
 import mariadb
 
 logger = logging.getLogger(__name__)
+
+def partition_name(mode: str) -> str:
+    """Generate a partition name from a mode value."""
+    h = hashlib.md5(mode.encode()).hexdigest()[:8]
+    return f"p_{h}"
 
 class DatabaseHandler:
     """Handles database operations for JSNL data."""
@@ -29,7 +35,7 @@ class DatabaseHandler:
         self.temp_conn = None  # Separate connection for temp table operations
         self.cursor = None
         self.known_instances = set()
-        self.temp_equity_table = 'temp_dashboard_equity'
+        self.temp_equity_table = 'dashboard_equity_staging'  # Changed to match new staging table name
         self.pool_size = 5
         self.connect_timeout = 10
         self.read_timeout = 30
@@ -103,35 +109,29 @@ class DatabaseHandler:
             raise
             
     def _create_temp_equity_table(self) -> None:
-        """Create a temporary table for equity records."""
+        """Create a staging table for equity records."""
         try:
             cursor = self._get_cursor(use_temp=True)
             
-            # Drop the temporary table if it exists
+            # Drop the staging table if it exists
             cursor.execute(f"DROP TABLE IF EXISTS {self.temp_equity_table}")
             
-            # Create temporary table with same structure as dashboard_equity
-            # Using InnoDB engine for disk-based storage
-            create_table_query = f"""
-                CREATE TABLE {self.temp_equity_table} (
-                    id varchar(255) NOT NULL,
-                    timestamp double NOT NULL,
-                    mode varchar(255) NOT NULL,
-                    equity double NOT NULL,
-                    PRIMARY KEY (id, timestamp, mode)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-            """
-            cursor.execute(create_table_query)
+            # Create staging table like the main table
+            cursor.execute(f"CREATE TABLE {self.temp_equity_table} LIKE dashboard_equity")
+            
+            # Remove partitioning from the staging table
+            cursor.execute(f"ALTER TABLE {self.temp_equity_table} REMOVE PARTITIONING")
+            
             self.temp_conn.commit()
             cursor.close()
-            logger.info(f"Created temporary equity table: {self.temp_equity_table}")
+            logger.info(f"Created staging equity table: {self.temp_equity_table}")
             
         except Exception as e:
-            logger.error(f"Error creating temporary equity table: {str(e)}")
+            logger.error(f"Error creating staging equity table: {str(e)}")
             raise
             
     def store_equity_batch(self, records: List[Dict[str, Any]]) -> None:
-        """Store a batch of equity records in the temporary table."""
+        """Store a batch of equity records in the staging table."""
         
         if not records:
             return
@@ -146,11 +146,11 @@ class DatabaseHandler:
                 # Get chunk of records
                 chunk = records[processed_records:processed_records + chunk_size]
                 
-                # Prepare SQL query for temporary table
+                # Prepare SQL query for staging table
                 query = f"""
                     INSERT INTO {self.temp_equity_table}
-                    (id, timestamp, mode, equity) 
-                    VALUES (%s, %s, %s, %s)
+                    (time_ns, mode, equity) 
+                    VALUES (%s, %s, %s)
                     ON DUPLICATE KEY UPDATE 
                     equity = VALUES(equity)
                 """
@@ -158,9 +158,10 @@ class DatabaseHandler:
                 # Prepare batch data for this chunk
                 batch_data = []
                 for record in chunk:
+                    # Convert timestamp to nanoseconds
+                    time_ns = int(record['timestamp'] * 1e9)
                     batch_data.append((
-                        record['log_id'],
-                        record['timestamp'],
+                        time_ns,
                         record['mode'],
                         record['value'].get('equity', 0.0)
                     ))
@@ -192,86 +193,32 @@ class DatabaseHandler:
                 processed_records += len(chunk)
                 logger.info(f"Processed {processed_records}/{total_records} equity records")
             
-            logger.info(f"Successfully stored all {total_records} equity records")
+            logger.info(f"Successfully stored all {total_records} equity records in staging table")
             
         except mariadb.Error as e:
-            logger.error(f"Error storing equity batch in temporary table: {str(e)}")
+            logger.error(f"Error storing equity batch in staging table: {str(e)}")
             if self.temp_conn:
                 self.temp_conn.rollback()
         except Exception as e:
-            logger.error(f"Unexpected error storing equity batch in temporary table: {str(e)}")
+            logger.error(f"Unexpected error storing equity batch in staging table: {str(e)}")
             logger.error(traceback.format_exc())
             if self.temp_conn:
                 self.temp_conn.rollback()
             
-    def merge_temp_equity_records(self) -> None:
-        """Merge temporary equity records into the main dashboard_equity table."""
-        try:
-            # Use temp connection to get count
-            temp_cursor = self._get_cursor(use_temp=True)
-            temp_cursor.execute(f"SELECT COUNT(*) FROM {self.temp_equity_table}")
-            total_records = temp_cursor.fetchone()[0]
-            temp_cursor.close()
-            
-            if total_records == 0:
-                logger.info("No records to merge from temporary table")
-                return
-                
-            # Process in chunks of 10000 records
-            chunk_size = 10000
-            processed_records = 0
-            
-            while processed_records < total_records:
-                # Use main connection for merging
-                cursor = self._get_cursor()
-                try:
-                    # Insert chunk of records
-                    merge_query = f"""
-                        INSERT INTO dashboard_equity 
-                        SELECT * FROM {self.temp_equity_table}
-                        LIMIT {chunk_size} OFFSET {processed_records}
-                        ON DUPLICATE KEY UPDATE 
-                        equity = VALUES(equity)
-                    """
-                    cursor.execute(merge_query)
-                    self.conn.commit()
-                    
-                    processed_records += chunk_size
-                    logger.info(f"Processed {min(processed_records, total_records)}/{total_records} records")
-                    
-                finally:
-                    cursor.close()
-            
-            # Drop temporary table after successful merge
-            temp_cursor = self._get_cursor(use_temp=True)
-            try:
-                temp_cursor.execute(f"DROP TABLE {self.temp_equity_table}")
-                self.temp_conn.commit()
-                logger.info("Successfully dropped temporary equity table")
-            finally:
-                temp_cursor.close()
-            
-            logger.info("Successfully merged all temporary equity records into main table")
-            
-        except Exception as e:
-            # Rollback on error
-            if self.conn:
-                self.conn.rollback()
-            if self.temp_conn:
-                self.temp_conn.rollback()
-            logger.error(f"Error merging temporary equity records: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
+    # def merge_temp_equity_records(self) -> None:
+    #     """Legacy method that calls merge_staging_equity for backward compatibility."""
+    #     logger.warning("merge_temp_equity_records is deprecated, use merge_staging_equity instead")
+    #     self.merge_staging_equity(None)
 
     def _load_existing_instances(self) -> None:
         """Load existing trading instances from the database into memory."""
         try:
             logger.info("Loading existing trading instances into memory")
             results = self.execute_read_query_with_retries(
-                "SELECT id, mode FROM trading_instances"
+                "SELECT mode FROM trading_instances"
             )
             if results:
-                self.known_instances = set((row[0], row[1]) for row in results)
+                self.known_instances = set(row[0] for row in results)
             logger.info(f"Loaded {len(self.known_instances)} existing trading instances")
         except Exception as e:
             logger.error(f"Error loading existing trading instances: {str(e)}")
@@ -476,24 +423,23 @@ class DatabaseHandler:
             record: Dictionary containing equity record data
         """        
         try:
+            # Convert timestamp to nanoseconds
+            time_ns = int(record['timestamp'] * 1e9)
+            
             # Prepare SQL query
             query = """
                 INSERT INTO dashboard_equity 
-                (id, timestamp, mode, equity) 
-                VALUES (%s, %s, %s, %s)
+                (time_ns, mode, equity) 
+                VALUES (%s, %s, %s)
                 ON DUPLICATE KEY UPDATE 
                 equity = VALUES(equity)
             """
-            
-            # Extract broker name (mode)
-            _broker = record.get('value', {}).get('b', 'unknown')
             
             # Execute query
             self.execute_write_query_with_retries(
                 query, 
                 (
-                    record['log_id'],
-                    record['timestamp'],
+                    time_ns,
                     record['mode'],
                     record['value'].get('equity', 0.0)
                 )
@@ -509,8 +455,12 @@ class DatabaseHandler:
     def store_trade(self, data: Dict[str, Any]) -> None:
         """Store trade data in the database."""
         try:
+            # Convert timestamp to nanoseconds
+            time_ns = int(data['timestamp'] * 1e9)
+            
             # Create JSON data for the dashboard_data table
             json_data = json.dumps({
+                "id": data.get('id', ''),
                 "instrument": data['instrument'],
                 "price": data['price'],
                 "profit": data['profit'],
@@ -518,17 +468,16 @@ class DatabaseHandler:
                 "t": data['type']
             })
             
-            # Check if a record with this timestamp, id, and type already exists
+            # Check if a record with this timestamp and type already exists
             check_query = """
-            SELECT id FROM trading.dashboard_data 
-            WHERE id = %s AND timestamp = %s AND mode = %s AND data_type = %s
+            SELECT time_ns FROM dashboard_data 
+            WHERE time_ns = %s AND mode = %s AND data_type = %s
             """
             
             existing = self.execute_read_fetchone_with_retries(
                 check_query, 
                 (
-                    data['log_id'],
-                    data['timestamp'],
+                    time_ns,
                     data['mode'],
                     data['type']
                 )
@@ -537,17 +486,16 @@ class DatabaseHandler:
             if existing:
                 # Update existing record
                 update_query = """
-                UPDATE trading.dashboard_data 
-                SET json_data = %s
-                WHERE id = %s AND timestamp = %s AND mode = %s AND data_type = %s
+                UPDATE dashboard_data 
+                SET data = %s
+                WHERE time_ns = %s AND mode = %s AND data_type = %s
                 """
                 
                 self.execute_write_query_with_retries(
                     update_query, 
                     (
                         json_data,
-                        data['log_id'],
-                        data['timestamp'],
+                        time_ns,
                         data['mode'],
                         data['type']
                     )
@@ -555,128 +503,58 @@ class DatabaseHandler:
             else:
                 # Insert new record
                 insert_query = """
-                INSERT INTO trading.dashboard_data 
-                (id, timestamp, mode, data_type, json_data) 
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO dashboard_data 
+                (time_ns, mode, data_type, data) 
+                VALUES (%s, %s, %s, %s)
                 """
                 
                 self.execute_write_query_with_retries(
                     insert_query, 
                     (
-                        data['log_id'],
-                        data['timestamp'],
+                        time_ns,
                         data['mode'],
                         data['type'],
                         json_data
                     )
                 )
             
-            logger.debug(f"Stored trade data for {data['log_id']} at {data['timestamp']}")
+            logger.debug(f"Stored trade data at {time_ns}")
             
         except Exception as e:
             logger.error(f"Failed to store trade data: {str(e)}")
             logger.error(traceback.format_exc())
 
-    def store_strand_metadata(self, strand_id: str, config: dict, name: str) -> bool:
-        """
-        Store or update strand metadata in the database.
-        
-        Args:
-            strand_id: Unique identifier for the strand
-            config: Strategy configuration dictionary
-            name: Name of the strategy
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            # Store config as JSON string and compress if needed
-            json_data = json.dumps(config)
-            
-            # Check if record exists
-            logger.info(f"Checking if strand metadata exists for strand_id: {strand_id}")
-            
-            # Use a single cursor for both operations
-            cursor = self._get_cursor()
-            try:
-                # Set max_allowed_packet to a larger value for this session
-                # cursor.execute("SET SESSION max_allowed_packet=67108864")  # 64MB
-                
-                # Check if record exists
-                cursor.execute(
-                    "SELECT id FROM dashboard_metadata WHERE id = %s AND component = 'strand'",
-                    (strand_id,)
-                )
-                record = cursor.fetchone()
-                logger.info(f"Record: {record}")
-                
-                if record:
-                    # Update existing record
-                    logger.info(f"Updating existing strand metadata for strand_id: {strand_id}")
-                    cursor.execute(
-                        "UPDATE dashboard_metadata SET name = %s, data = %s WHERE id = %s AND component = 'strand'",
-                        (name, json_data, strand_id)
-                    )
-                    logger.info(f"Updated existing strand metadata for strand_id: {strand_id}")
-                else:
-                    # Insert new record
-                    logger.info(f"Inserting new strand metadata for strand_id: {strand_id}")
-                    cursor.execute(
-                        "INSERT INTO dashboard_metadata (id, component, name, data) VALUES (%s, %s, %s, %s)",
-                        (strand_id, 'strand', name, json_data)
-                    )
-                    logger.info(f"Inserted new strand metadata for strand_id: {strand_id}")
-                
-                # Commit the transaction
-                self.conn.commit()
-                return True
-                
-            finally:
-                cursor.close()
-            
-        except mariadb.Error as e:
-            logger.error(f"Database error storing strand metadata: {str(e)}")
-            if self.conn:
-                self.conn.rollback()
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error storing strand metadata: {str(e)}")
-            logger.error(traceback.format_exc())
-            if self.conn:
-                self.conn.rollback()
-            return False
 
-    def store_trading_instance(self, instance_id: str, mode: str, instance_type: str, config: dict) -> bool:
+    def store_trading_instance(self, mode: str, component: str, designator: str, config: dict) -> bool:
         """
         Store a trading instance in the database if it doesn't exist.
         
         Args:
-            instance_id: The instance identifier (log_id)
-            mode: The trading mode
-            instance_type: The type of trading instance
-            config: The configuration dictionary
+            mode: The trading mode (primary key)
+            component: The component name
+            designator: The designator value
+            config: The configuration dictionary to store in the data field
         Returns:
             bool: True if successful, False otherwise
         """
         try:
             # Check if we've seen this instance before
-            instance_key = (instance_id, mode)
-            if instance_key in self.known_instances:
+            if mode in self.known_instances:
                 return True
             
             # Prepare data JSON if we have config
             data_json = None
             if config:
-                data_json = json.dumps({'config': config})
+                data_json = json.dumps(config)
             
             # New instance found, add to database
             self.execute_write_query_with_retries(
-                "INSERT IGNORE INTO trading_instances (id, mode, instance_type, data) VALUES (%s, %s, %s, %s)",
-                (instance_id, mode, instance_type, data_json)
+                "INSERT IGNORE INTO trading_instances (mode, component, designator, data) VALUES (%s, %s, %s, %s)",
+                (mode, component, designator, data_json)
             )
             
             # Add to known instances set
-            self.known_instances.add(instance_key)
+            self.known_instances.add(mode)
             return True
             
         except Exception as e:
@@ -692,3 +570,77 @@ class DatabaseHandler:
             self.temp_conn.close()
             self.temp_conn = None
         logger.info("Disconnected from database")
+
+    def merge_staging_equity(self, last_mode: str) -> None:
+        """Merge staging equity records into the main dashboard_equity table for the current run."""
+        try:
+            # Use temp connection to get unique modes from staging table
+            mode = None
+            if not last_mode:
+                temp_cursor = self._get_cursor(use_temp=True)
+                temp_cursor.execute(f"SELECT DISTINCT mode FROM {self.temp_equity_table}")
+                mode = [row[0] for row in temp_cursor.fetchall()][0]
+                temp_cursor.close()
+            else:
+                mode = last_mode
+            
+            if not mode:
+                logger.info("No records to merge from staging table")
+                return
+                
+            # Get partition name for this mode
+            p_name = partition_name(mode)
+            
+            # Use main connection for partition operations
+            cursor = self._get_cursor()
+            try:
+                # Add partition if it doesn't exist
+                add_partition_query = f"""
+                    ALTER TABLE dashboard_equity
+                    ADD PARTITION (
+                        PARTITION {p_name} VALUES IN ('{mode}')
+                    )
+                """
+                try:
+                    cursor.execute(add_partition_query)
+                    self.conn.commit()
+                    logger.info(f"Added partition {p_name} for mode {mode}")
+                except mariadb.Error as e:
+                    if "Duplicate partition name" in str(e):
+                        logger.info(f"Partition {p_name} already exists for mode {mode}")
+                    else:
+                        raise
+                
+                # Exchange partition with staging table
+                exchange_query = f"""
+                    ALTER TABLE dashboard_equity
+                    EXCHANGE PARTITION {p_name} WITH TABLE {self.temp_equity_table}
+                    WITHOUT VALIDATION
+                """
+                cursor.execute(exchange_query)
+                self.conn.commit()
+                logger.info(f"Exchanged partition {p_name} with staging table for mode {mode}")
+                
+            finally:
+                cursor.close()
+            
+            # Truncate staging table after successful merge
+            temp_cursor = self._get_cursor(use_temp=True)
+            try:
+                temp_cursor.execute(f"TRUNCATE TABLE {self.temp_equity_table}")
+                self.temp_conn.commit()
+                logger.info("Successfully truncated staging equity table")
+            finally:
+                temp_cursor.close()
+            
+            logger.info("Successfully merged staging equity records into main table")
+            
+        except Exception as e:
+            # Rollback on error
+            if self.conn:
+                self.conn.rollback()
+            if self.temp_conn:
+                self.temp_conn.rollback()
+            logger.error(f"Error merging staging equity records: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise

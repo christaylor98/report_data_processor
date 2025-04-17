@@ -44,6 +44,7 @@ class JSNLProcessor:
         """
         self.config = config
         self.max_files = max_files
+        self.current_file = None  # Track current file being processed
         
         # Initialize database handler
         self.db_handler = DatabaseHandler(config)
@@ -51,8 +52,8 @@ class JSNLProcessor:
         # Initialize DuckDB connection
         self.conn = None
         
-        # Track last equity value for each (log_id, mode) pair
-        self.last_equity_values = {}  # Format: {(log_id, mode): last_equity_value}
+        # Track last equity value for each mode
+        self.last_equity_values = {}  # Format: {mode: last_equity_value}
         
         # Track all equity records for final merge
         self.all_equity_records = []
@@ -191,6 +192,9 @@ class JSNLProcessor:
         """
         logger.info(f"Processing file {file_path}")
         
+        # Set current file being processed
+        self.current_file = file_path
+        
         # Reset tracking dictionaries for new file
         self.last_equity_values = {}
         
@@ -270,7 +274,7 @@ class JSNLProcessor:
         # Temporary storage for candles and equity records
         # candles = {}  # Format: {(log_id, timestamp): candle_data}
         equity_records_data = []  # List of equity records
-        
+        last_mode = None
         try:
             read_start = time.time()
             with open(file_path, 'rb') as f:
@@ -298,7 +302,7 @@ class JSNLProcessor:
                                 continue
 
                             # Parse and process the line
-                            self._process_single_line(line_str, records, timestamps, stats, 
+                            last_mode =self._process_single_line(line_str, records, timestamps, stats, 
                                                    equity_records_data)
                         
                         except json.JSONDecodeError:
@@ -325,6 +329,9 @@ class JSNLProcessor:
             # Process equity records with associated candles
             self._process_equity_records(equity_records_data)
             
+            # Merge staging equity records into main table
+            self.db_handler.merge_staging_equity(last_mode)
+            
             # Log statistics
             self._log_processing_stats(file_path, stats)
             
@@ -333,7 +340,7 @@ class JSNLProcessor:
         except Exception as e:
             logger.error(f"Failed to process file {file_path}: {str(e)}")
             logger.error(traceback.format_exc())
-            return [], set(), stats
+        
     
     def _process_single_line(self, line_str: str, records: List[Dict], timestamps: Set[float],
                            stats: Dict[str, int], equity_records_data: List[Dict]) -> None:
@@ -352,13 +359,12 @@ class JSNLProcessor:
         stats['total_records'] += 1
     
         # Extract required fields
-        log_id = data.get('log_id')
         timestamp = data.get('timestamp')
         mode = data.get('mode')
         component = data.get('component')
         value_obj = data.get('value', {})
         
-        if not log_id or not timestamp or not value_obj or not mode or not component:
+        if not timestamp or not value_obj or not mode or not component:
             stats['missing_fields'] += 1
             return
         
@@ -366,42 +372,22 @@ class JSNLProcessor:
         if isinstance(timestamp, str):
             timestamp = float(timestamp)
         
-        # Store trading instance for this record - will be skipped if already stored
-        # self.db_handler.store_trading_instance(log_id, mode)
-        
         # Process the value object
-        self._process_value_object(log_id, timestamp, mode, component, value_obj,
+        self._process_value_object(timestamp, mode, component, value_obj,
                                                   equity_records_data, records, stats)
-        
-        # Skip lines that contain ONLY candle, equity, or trade data for Parquet storage
-        # if not has_other_data:
-        #     stats['skipped_db_only_records'] += 1
-        #     return
         
         # Add timestamp to set for later use
         timestamps.add(timestamp)
-        
-        # Create record with common fields
-        # record = {
-        #     'log_id': log_id,
-        #     'timestamp': timestamp,
-        #     'mode': mode,
-        #     'component': component,
-        #     'filename': os.path.basename(file_path),
-        #     'data': line_str,
-        # }
-        
-        # # Add to records list
-        # records.append(record)
+
+        return mode
     
-    def _process_value_object(self, log_id: str, timestamp: float, mode: str, component: str,
+    def _process_value_object(self, timestamp: float, mode: str, component: str,
                             value_obj: Dict, equity_records_data: List[Dict], records: List[Dict],
                             stats: Dict[str, int]) -> bool:
         """
         Process a value object from a JSNL record.
         
         Args:
-            log_id: The log ID
             timestamp: The timestamp
             mode: The mode
             component: The component
@@ -433,7 +419,7 @@ class JSNLProcessor:
         # Check if we should store equity based on configuration
         if self.config.get('equity_on_change', True):
             # Only store if value changed from previous
-            previous_equity = self.last_equity_values.get((log_id, mode), None)
+            previous_equity = self.last_equity_values.get(mode, None)
             if (previous_equity is None) or (previous_equity != equity['value']['equity']):
                 store_equity = True
         else:
@@ -442,9 +428,7 @@ class JSNLProcessor:
 
         # Process trade records 
         if trades:
-            # store_equity = True  # Always store equity when there are trades
             for trade in trades:
-                trade['log_id'] = log_id
                 trade['timestamp'] = timestamp
                 trade['mode'] = mode
                 trade['component'] = component
@@ -452,9 +436,7 @@ class JSNLProcessor:
                 stats['trade_records'] += 1
         # Process other records
         if others:
-            # store_equity = True
             record_data = {
-                'log_id': log_id,
                 'timestamp': timestamp,
                 'mode': mode,
                 'component': component,
@@ -467,13 +449,12 @@ class JSNLProcessor:
 
         # Process equity records
         if store_equity:
-            equity['log_id'] = log_id
             equity['timestamp'] = timestamp
             equity['mode'] = mode
             equity['component'] = component
             equity_records_data.append(equity)
             stats['equity_records'] += 1
-            self.last_equity_values[(log_id, mode)] = equity['value']['equity']
+            self.last_equity_values[mode] = equity['value']['equity']
         else:
             stats['skipped_equity_records'] += 1
         
@@ -615,7 +596,8 @@ class JSNLProcessor:
                 'instrument': value_item.get('instrument', ''),
                 'price': float(value_item.get('price', 0.0)),
                 'units': float(value_item.get('units', 0.0)),
-                'profit': float(value_item.get('profit', 0.0))
+                'profit': float(value_item.get('profit', 0.0)),
+                'id': value_item.get('id', '')
             }
 
             trades.append(trade_data)
@@ -648,12 +630,15 @@ class JSNLProcessor:
             
             # Get strategy name from config
             strategy_name = config.get('name', 'Unnamed Strategy')
+
+            # Add file name and processing timestamp to config
+            config['source_file'] = self.current_file
+            config['processed_at'] = datetime.now().isoformat()
             
             logger.info(f"Processing strand_started message: {strand_id}, {config}, {strategy_name}")
             # Store metadata in database
-            self.db_handler.store_strand_metadata(strand_id, config, strategy_name)
-            self.db_handler.store_trading_instance(strand_id, mode, "strand", config)
-
+            self.db_handler.store_trading_instance(mode, "strand", "unknown", config)
+            # TODO: Extract designator from config ie UIM, UOM etc
             return True
             
         except Exception as e:
@@ -683,7 +668,7 @@ class JSNLProcessor:
     
     def create_weekly_files(self, min_timestamp: float, max_timestamp: float) -> None:
         """
-        Create weekly Parquet files from temp files, organized by ID.
+        Create weekly Parquet files from temp files, organized by mode.
         
         Args:
             min_timestamp: Minimum timestamp in the data
@@ -708,43 +693,43 @@ class JSNLProcessor:
         # Find all temp files
         temp_files = glob.glob(os.path.join(self.config['temp_dir'], '*.parquet'))
         
-        # First, group files by log_id
-        id_groups = {}
+        # First, group files by mode
+        mode_groups = {}
         
-        # Read each temp file to get unique log_ids
+        # Read each temp file to get unique modes
         for temp_file in temp_files:
             try:
-                table = pq.read_table(temp_file, columns=['log_id'])
+                table = pq.read_table(temp_file, columns=['mode'])
                 df = table.to_pandas()
-                unique_ids = df['log_id'].unique()
+                unique_modes = df['mode'].unique()
                 
-                # Add file to each ID's group
-                for log_id in unique_ids:
-                    if log_id not in id_groups:
-                        id_groups[log_id] = []
-                    id_groups[log_id].append(temp_file)
+                # Add file to each mode's group
+                for mode in unique_modes:
+                    if mode not in mode_groups:
+                        mode_groups[mode] = []
+                    mode_groups[mode].append(temp_file)
                 
             except Exception as e:
                 logger.error(f"Error reading temp file {temp_file}: {str(e)}")
         
-        logger.info(f"Found {len(id_groups)} unique log IDs")
+        logger.info(f"Found {len(mode_groups)} unique modes")
         
-        # Process each ID separately
-        for log_id, id_temp_files in id_groups.items():
-            logger.info(f"Processing files for log_id: {log_id}")
+        # Process each mode separately
+        for mode, mode_temp_files in mode_groups.items():
+            logger.info(f"Processing files for mode: {mode}")
             
-            # Create weekly files for this ID
+            # Create weekly files for this mode
             current_week = start_of_week
             while current_week < end_of_week:
                 week_start_time = time.time()
                 next_week = current_week + timedelta(days=7)
                 
-                logger.info(f"Processing week for {log_id}: {current_week} to {next_week}")
+                logger.info(f"Processing week for {mode}: {current_week} to {next_week}")
                 
-                # Create ID-specific weekly file path
+                # Create mode-specific weekly file path
                 weekly_file = os.path.join(
                     self.config['output_dir'],
-                    str(log_id),  # Create subdirectory for this ID
+                    str(mode),  # Create subdirectory for this mode
                     'weekly',
                     f"weekly_{current_week.strftime('%Y%m%d')}.parquet"
                 )
@@ -759,15 +744,15 @@ class JSNLProcessor:
                 filtered_temp_files = []
                 has_new_data = False
                 
-                for temp_file in id_temp_files:
+                for temp_file in mode_temp_files:
                     try:
                         # Read the Parquet file
-                        table = pq.read_table(temp_file, columns=['timestamp', 'log_id'])
+                        table = pq.read_table(temp_file, columns=['timestamp', 'mode'])
                         df = table.to_pandas()
                         
-                        # Filter for this ID and timestamp range
+                        # Filter for this mode and timestamp range
                         df = df[
-                            (df['log_id'] == log_id) & 
+                            (df['mode'] == mode) & 
                             (df['timestamp'] >= week_start_ts) & 
                             (df['timestamp'] < week_end_ts)
                         ]
@@ -792,7 +777,7 @@ class JSNLProcessor:
                             SELECT * FROM parquet_scan({files_array})
                             WHERE timestamp >= {week_start_ts} 
                             AND timestamp < {week_end_ts}
-                            AND log_id = '{log_id}'
+                            AND mode = '{mode}'
                             ORDER BY timestamp
                         """)
                         
@@ -806,18 +791,18 @@ class JSNLProcessor:
                                 COPY merged TO '{weekly_file}' (FORMAT 'parquet')
                             """)
                             merge_end = time.time()
-                            logger.info(f"Merged {record_count} records into weekly file for {log_id} in {merge_end - merge_start:.2f} seconds: {weekly_file}")
+                            logger.info(f"Merged {record_count} records into weekly file for {mode} in {merge_end - merge_start:.2f} seconds: {weekly_file}")
                         else:
-                            logger.info(f"No records found for {log_id} in period {current_week} to {next_week}, skipping")
+                            logger.info(f"No records found for {mode} in period {current_week} to {next_week}, skipping")
                     
                     except Exception as e:
-                        logger.error(f"Failed to create weekly file for {log_id} period {current_week}: {str(e)}")
+                        logger.error(f"Failed to create weekly file for {mode} period {current_week}: {str(e)}")
                         logger.error(traceback.format_exc())
                 else:
-                    logger.info(f"No new data for {log_id} in period {current_week} to {next_week}, skipping")
+                    logger.info(f"No new data for {mode} in period {current_week} to {next_week}, skipping")
                 
                 week_end_time = time.time()
-                logger.info(f"Processing week {current_week} to {next_week} for {log_id} took {week_end_time - week_start_time:.2f} seconds")
+                logger.info(f"Processing week {current_week} to {next_week} for {mode} took {week_end_time - week_start_time:.2f} seconds")
                 
                 # Move to next week
                 current_week = next_week
@@ -871,12 +856,12 @@ class JSNLProcessor:
             generated_files = self.process_jsnl_files()
             logger.info(f"Generated {len(generated_files)} Parquet files")
             
-            # Merge all equity records into the main table
-            logger.info("Merging equity records into main table")
-            merge_start = time.time()
-            self.db_handler.merge_temp_equity_records()
-            merge_end = time.time()
-            logger.info(f"Equity records merge took {merge_end - merge_start:.2f} seconds")
+            # # Merge all equity records into the main table
+            # logger.info("Merging equity records into main table")
+            # merge_start = time.time()
+            # self.db_handler.merge_temp_equity_records()
+            # merge_end = time.time()
+            # logger.info(f"Equity records merge took {merge_end - merge_start:.2f} seconds")
             
             # Clean up old temp files
             self.cleanup_old_temp_files()
