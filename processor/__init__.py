@@ -622,7 +622,10 @@ class JSNLProcessor:
             strand_id = message.get('strand_id')
             mode = message.get('mode', 'unknown')
             config = message.get('config', {})
-            
+            config_path = message.get('config_file_path', '')
+            designator = 'strand_simulation'
+            tuning_date_range = config.get('tuning_date_range', '')
+
             # Validate required fields
             if not strand_id:
                 logger.error("Missing strand_id in strand_started message")
@@ -634,10 +637,13 @@ class JSNLProcessor:
             # Add file name and processing timestamp to config
             config['source_file'] = self.current_file
             config['processed_at'] = datetime.now().isoformat()
-            
+            config['config_path'] = config_path
+            config['designator'] = designator
+            config['tuning_date_range'] = tuning_date_range
+
             logger.info(f"Processing strand_started message: {strand_id}, {config}, {strategy_name}")
             # Store metadata in database
-            self.db_handler.store_trading_instance(mode, "strand", "unknown", config)
+            self.db_handler.store_trading_instance(mode, designator, strand_id, config)
             # TODO: Extract designator from config ie UIM, UOM etc
             return True
             
@@ -685,7 +691,7 @@ class JSNLProcessor:
         start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
         
         # Get the end of the week for max_dt
-        end_of_week = max_dt + timedelta(days=(7 - max_dt.weekday()))
+        end_of_week = max_dt + timedelta(days= 7 - max_dt.weekday())
         end_of_week = end_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
         
         logger.info(f"Processing weeks from {start_of_week} to {end_of_week}")
