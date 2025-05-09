@@ -28,6 +28,7 @@ import pyarrow.parquet as pq
 import pandas as pd
 
 from db import DatabaseHandler
+from .config_cache import ModeConfigCache
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,9 @@ class JSNLProcessor:
         
         # Initialize DuckDB connection
         self.conn = None
+        
+        # Initialize mode config cache
+        self.mode_cache = ModeConfigCache(self.db_handler)
         
         # Track last equity value for each mode
         self.last_equity_values = {}  # Format: {mode: last_equity_value}
@@ -343,7 +347,7 @@ class JSNLProcessor:
         
     
     def _process_single_line(self, line_str: str, records: List[Dict], timestamps: Set[float],
-                           stats: Dict[str, int], equity_records_data: List[Dict]) -> None:
+                           stats: Dict[str, int], equity_records_data: List[Dict]) -> Optional[str]:
         """
         Process a single line from the JSNL file.
         
@@ -353,6 +357,9 @@ class JSNLProcessor:
             timestamps: Set to store timestamps
             stats: Statistics dictionary
             equity_records_data: List to store equity records
+            
+        Returns:
+            Optional[str]: The mode if found, None otherwise
         """
         # Parse JSON
         data = json.loads(line_str)
@@ -366,14 +373,21 @@ class JSNLProcessor:
         
         if not timestamp or not value_obj or not mode or not component:
             stats['missing_fields'] += 1
-            return
+            return None
+        
+        # Check if we have config for this mode
+        config = self.mode_cache.get_config(mode)
+        if not config:
+            logger.warning(f"No configuration found for mode {mode}, skipping record")
+            stats['missing_fields'] += 1
+            return None
         
         # Convert timestamp to float if it's not already
         if isinstance(timestamp, str):
             timestamp = float(timestamp)
         
         # Process the value object
-        self._process_value_object(timestamp, mode, component, value_obj,
+        has_other_data = self._process_value_object(timestamp, mode, component, value_obj,
                                                   equity_records_data, records, stats)
         
         # Add timestamp to set for later use
@@ -401,14 +415,18 @@ class JSNLProcessor:
         """
         has_other_data = False
         
+        # Handle single value object
+        if isinstance(value_obj, dict):
+            value_obj = [value_obj]
+            
         equity = None
         trades = []
         others = []
-        if isinstance(value_obj, list):
-            for item in value_obj:
-                new_equity = self.process_value_item(item, trades, others)
-                if new_equity:
-                    equity = new_equity
+        
+        for item in value_obj:
+            new_equity = self.process_value_item(item, trades, others)
+            if new_equity:
+                equity = new_equity
 
         # No equity records, no further processing
         if not equity:
@@ -434,6 +452,7 @@ class JSNLProcessor:
                 trade['component'] = component
                 self.db_handler.store_trade(trade)
                 stats['trade_records'] += 1
+                
         # Process other records
         if others:
             record_data = {
@@ -467,13 +486,56 @@ class JSNLProcessor:
         Args:
             equity_records_data: List of equity records
         """
+        if not equity_records_data:
+            logger.debug("No equity records to process")
+            return
+        
+        logger.debug(f"Processing {len(equity_records_data)} equity records")
         db_start = time.time()
         
-        # Store records in temporary table
-        self.db_handler.store_equity_batch(equity_records_data)
+        # Group records by mode and check if they are live
+        live_records = []
+        non_live_records = []
         
+        for record in equity_records_data:
+            try:
+                # Validate equity value
+                equity_value = record['value'].get('equity')
+                logger.debug(f"Processing record for mode {record['mode']} with equity value: {equity_value}")
+                
+                if not isinstance(equity_value, (int, float)):
+                    logger.warning(f"Invalid equity value type for mode {record['mode']}: {equity_value}")
+                    continue
+                
+                mode = record['mode']
+                config = self.mode_cache.get_config(mode)
+                
+                if config and config.get('live', False):
+                    logger.debug(f"Mode {mode} is live, adding to live records")
+                    live_records.append(record)
+                else:
+                    logger.debug(f"Mode {mode} is not live, adding to non-live records")
+                    non_live_records.append(record)
+            except Exception as e:
+                logger.error(f"Error processing equity record: {str(e)}")
+                logger.debug(f"Failed record: {record}")
+                continue
+        
+        # Process live records
+        if live_records:
+            logger.debug(f"Processing {len(live_records)} live records")
+            self.db_handler.store_live_equity_batch(live_records)
+            logger.debug("Successfully stored live equity records")
+            
+        # Process non-live records
+        if non_live_records:
+            logger.debug(f"Processing {len(non_live_records)} non-live records")
+            self.db_handler.store_equity_batch(non_live_records)
+            logger.debug("Successfully stored non-live equity records")
+            
         db_end = time.time()
         logger.info(f"Database operations took {db_end - db_start:.2f} seconds for {len(equity_records_data)} equity records")
+        logger.debug(f"Processed {len(live_records)} live records and {len(non_live_records)} non-live records")
     
     def _save_and_cleanup(self, file_path: str, output_file: str, records: List[Dict],
                          timestamps: Set[float]) -> Tuple[str, Set[float]]:
@@ -626,6 +688,12 @@ class JSNLProcessor:
             designator = 'strand_simulation'
             tuning_date_range = config.get('tuning_date_range', '')
 
+            live = config.get('live', False)
+            is_live = live if isinstance(live, bool) else live.lower() == 'true'
+
+            if is_live:
+                designator = 'strand_live'
+
             # Validate required fields
             if not strand_id:
                 logger.error("Missing strand_id in strand_started message")
@@ -640,11 +708,17 @@ class JSNLProcessor:
             config['config_path'] = config_path
             config['designator'] = designator
             config['tuning_date_range'] = tuning_date_range
-
+            config['live'] = is_live
+            
             logger.info(f"Processing strand_started message: {strand_id}, {config}, {strategy_name}")
-            # Store metadata in database
-            self.db_handler.store_trading_instance(mode, designator, strand_id, config)
-            # TODO: Extract designator from config ie UIM, UOM etc
+            
+            # Store in cache and database
+            try:
+                self.mode_cache.add_config(mode, config)
+            except Exception as e:
+                logger.error(f"Failed to store config in cache/database: {str(e)}")
+                return False
+                
             return True
             
         except Exception as e:

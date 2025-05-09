@@ -44,33 +44,46 @@ class DatabaseHandler:
     def init_pool(self) -> None:
         """Initialize the database connection pool."""
         try:
-            # Create main connection pool with timeouts
-            self.conn = mariadb.connect(
-                host=os.getenv('DB_HOST', 'localhost'),
-                user=os.getenv('DB_USER', 'root'),
-                password=os.getenv('DB_PASSWORD', ''),
-                database=os.getenv('DB_NAME', 'trading'),
-                pool_name='mypool',
-                pool_size=self.pool_size,
-                connect_timeout=self.connect_timeout,
-                read_timeout=self.read_timeout,
-                write_timeout=self.write_timeout,
-                autocommit=False
-            )
-            
-            # Create separate connection for temp table operations
-            self.temp_conn = mariadb.connect(
-                host=os.getenv('DB_HOST', 'localhost'),
-                user=os.getenv('DB_USER', 'root'),
-                password=os.getenv('DB_PASSWORD', ''),
-                database=os.getenv('DB_NAME', 'trading'),
-                pool_name='temp_pool',
-                pool_size=1,  # Single connection for temp operations
-                connect_timeout=self.connect_timeout,
-                read_timeout=self.read_timeout,
-                write_timeout=self.write_timeout,
-                autocommit=False
-            )
+
+            # Test the connection and skip if it already exists
+            if self.conn and self.conn.open:
+                logger.info("Database connection already initialized")
+            else:
+                # Create main connection pool with timeouts
+                self.conn = mariadb.connect(
+                    host=os.getenv('DB_HOST', 'localhost'),
+                    user=os.getenv('DB_USER', 'finance'),
+                    password=os.getenv('DB_PASSWORD', ''),
+                    database=os.getenv('DB_NAME', 'trading'),
+                    pool_name='mypool',
+                    pool_size=self.pool_size,
+                    connect_timeout=self.connect_timeout,
+                    read_timeout=self.read_timeout,
+                    write_timeout=self.write_timeout,
+                    autocommit=False
+                )
+
+                logger.info(f"Database connection: {self.conn}")
+
+            # Test the connection and skip if it already exists
+            if self.temp_conn and self.temp_conn.open:
+                logger.info("Temporary database connection already initialized")
+            else:
+                # Create separate connection for temp table operations
+                self.temp_conn = mariadb.connect(
+                    host=os.getenv('DB_HOST', 'localhost'),
+                    user=os.getenv('DB_USER', 'finance'),
+                    password=os.getenv('DB_PASSWORD', ''),
+                    database=os.getenv('DB_NAME', 'trading'),
+                    pool_name='temp_pool',
+                    pool_size=1,  # Single connection for temp operations
+                    connect_timeout=self.connect_timeout,
+                    read_timeout=self.read_timeout,
+                    write_timeout=self.write_timeout,
+                    autocommit=False
+                )
+
+                logger.info(f"Temporary database connection: {self.temp_conn}")
             
             # Create temporary equity table if it doesn't exist
             self._create_temp_equity_table()
@@ -644,3 +657,164 @@ class DatabaseHandler:
             logger.error(f"Error merging staging equity records: {str(e)}")
             logger.error(traceback.format_exc())
             raise
+
+    def ensure_partition_exists(self, mode: str) -> bool:
+        """
+        Ensure that a partition exists for the given mode.
+        
+        Args:
+            mode: The mode identifier
+            
+        Returns:
+            bool: True if partition exists or was created successfully
+        """
+        try:
+            logger.debug(f"Checking partition existence for mode: {mode}")
+            
+            # Get partition name
+            p_name = partition_name(mode)
+            logger.debug(f"Generated partition name: {p_name}")
+            
+            # Check if partition exists
+            check_query = f"""
+                SELECT COUNT(*) 
+                FROM information_schema.partitions 
+                WHERE table_schema = DATABASE()
+                AND table_name = 'dashboard_equity'
+                AND partition_name = '{p_name}'
+            """
+            
+            logger.debug("Executing partition existence check query")
+            result = self.execute_read_fetchone_with_retries(check_query)
+            if result and result[0] > 0:
+                logger.debug(f"Partition {p_name} already exists for mode {mode}")
+                return True
+            
+            logger.debug(f"Partition {p_name} does not exist, creating new partition")
+            
+            # Create partition if it doesn't exist
+            add_partition_query = f"""
+                ALTER TABLE dashboard_equity
+                ADD PARTITION (
+                    PARTITION {p_name} VALUES IN ('{mode}')
+                )
+            """
+            
+            logger.debug("Executing partition creation query")
+            self.execute_write_query_with_retries(add_partition_query)
+            logger.debug(f"Successfully created partition {p_name} for mode {mode}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error ensuring partition exists for mode {mode}: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
+
+    def store_live_equity(self, record: Dict[str, Any]) -> None:
+        """
+        Store equity record directly in the final table for live data.
+        
+        Args:
+            record: Dictionary containing equity record data
+        """
+        try:
+            # Convert timestamp to nanoseconds
+            time_ns = int(record['timestamp'] * 1e9)
+            mode = record['mode']
+            
+            # Ensure partition exists
+            if not self.ensure_partition_exists(mode):
+                logger.error(f"Cannot store equity record - partition creation failed for mode {mode}")
+                return
+            
+            # Prepare SQL query
+            query = """
+                INSERT INTO dashboard_equity 
+                (time_ns, mode, equity) 
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE 
+                equity = VALUES(equity)
+            """
+            
+            # Execute query
+            self.execute_write_query_with_retries(
+                query, 
+                (
+                    time_ns,
+                    mode,
+                    record['value'].get('equity', 0.0)
+                )
+            )
+            
+        except Exception as e:
+            logger.error(f"Error storing live equity record: {str(e)}")
+            logger.error(f"Record: {record}")
+
+    def store_live_equity_batch(self, records: List[Dict[str, Any]]) -> None:
+        """
+        Store a batch of equity records directly in the final table for live data.
+        
+        Args:
+            records: List of equity records
+        """
+        if not records:
+            logger.debug("No records to store in live equity batch")
+            return
+        
+        try:
+            logger.debug(f"Processing {len(records)} records for live equity batch")
+            
+            # Group records by mode
+            mode_groups = {}
+            for record in records:
+                mode = record['mode']
+                if mode not in mode_groups:
+                    mode_groups[mode] = []
+                mode_groups[mode].append(record)
+            
+            logger.debug(f"Grouped records into {len(mode_groups)} modes: {list(mode_groups.keys())}")
+            
+            # Process each mode's records
+            for mode, mode_records in mode_groups.items():
+                logger.debug(f"Processing {len(mode_records)} records for mode {mode}")
+                
+                # Ensure partition exists
+                if not self.ensure_partition_exists(mode):
+                    logger.error(f"Cannot store equity records - partition creation failed for mode {mode}")
+                    continue
+                
+                # Process records in chunks
+                chunk_size = 1000
+                for i in range(0, len(mode_records), chunk_size):
+                    chunk = mode_records[i:i + chunk_size]
+                    logger.debug(f"Processing chunk {i//chunk_size + 1} of {(len(mode_records) + chunk_size - 1)//chunk_size} for mode {mode}")
+                    
+                    # Prepare batch data
+                    batch_data = []
+                    for record in chunk:
+                        time_ns = int(record['timestamp'] * 1e9)
+                        equity_value = record['value'].get('equity', 0.0)
+                        logger.debug(f"Preparing record - Time: {time_ns}, Mode: {mode}, Equity: {equity_value}")
+                        batch_data.append((
+                            time_ns,
+                            mode,
+                            equity_value
+                        ))
+                    
+                    # Insert batch
+                    query = """
+                        INSERT INTO dashboard_equity 
+                        (time_ns, mode, equity) 
+                        VALUES (%s, %s, %s)
+                        ON DUPLICATE KEY UPDATE 
+                        equity = VALUES(equity)
+                    """
+                    
+                    logger.debug(f"Executing batch insert for {len(batch_data)} records")
+                    self.execute_write_batch_query_with_retries(query, batch_data)
+                    logger.debug(f"Successfully inserted batch for mode {mode}")
+                
+        except Exception as e:
+            logger.error(f"Error storing live equity batch: {str(e)}")
+            logger.error(traceback.format_exc())
+            logger.debug(f"Failed records: {records}")
