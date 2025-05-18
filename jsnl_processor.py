@@ -23,7 +23,7 @@ load_dotenv()
 # Base directories
 BASE_DATA_DIR = '/data'
 PROCESS_DIR = f'{BASE_DATA_DIR}/to_process'
-PROCESSED_DIR = f'{BASE_DATA_DIR}/processed'
+PROCESSED_DIR = '/data2/processed'
 PARQUET_DIR = f'{BASE_DATA_DIR}/parquet'
 LOG_DIR = 'log'
 
@@ -66,9 +66,29 @@ for dir_path in [CONFIG['input_dir'], CONFIG['processed_dir'], CONFIG['output_di
 
 def parse_arguments():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Process JSNL files into Parquet format.')
+    parser = argparse.ArgumentParser(
+        description='Process JSNL files into Parquet format.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  Process all files in default directories:
+    python jsnl_processor.py
+
+  Process a specific file:
+    python jsnl_processor.py --file /path/to/file.jsnl
+
+  Process files from custom directories:
+    python jsnl_processor.py --source_path /custom/input --processed_path /custom/processed
+
+  Limit processing to N files:
+    python jsnl_processor.py --limit 10
+        """
+    )
     parser.add_argument('--file', '-f', help='Process a single specific file')
+    parser.add_argument('--source_path', '-s', help='Source path to process')
+    parser.add_argument('--processed_path', '-p', help='Processed path to process')
     parser.add_argument('--limit', '-l', type=int, help='Limit processing to N files')
+    parser.add_argument('--leave-source-files', '-ls', action='store_true', help='Leave source files in input directory')
     return parser.parse_args()
 
 
@@ -87,6 +107,10 @@ def main():
                 'password': os.getenv('DB_PASSWORD', ''),
                 'database': os.getenv('DB_NAME', 'trading')
             }
+
+        CONFIG['input_dir'] = args.source_path if args.source_path else CONFIG['input_dir']
+        CONFIG['processed_dir'] = args.processed_path if args.processed_path else CONFIG['processed_dir']
+        CONFIG['leave_source_files'] = args.leave_source_files if args.leave_source_files else False
         
         # Create processor with file limit if specified
         processor = JSNLProcessor(CONFIG, max_files=args.limit)

@@ -144,17 +144,18 @@ class JSNLProcessor:
                 move_start = time.time()
                 processed_path = os.path.join(self.config['processed_dir'], os.path.basename(jsnl_file))
                 
-                # Check if file still exists before moving
-                if os.path.exists(jsnl_file):
-                    try:
-                        shutil.move(jsnl_file, processed_path)
-                        logger.info(f"Moved processed file to {processed_path}")
-                    except (shutil.Error, OSError) as e:
-                        logger.warning(f"Could not move file {jsnl_file} to {processed_path}: {str(e)}")
-                else:
-                    logger.warning(f"File no longer exists, cannot move: {jsnl_file}")
-                move_end = time.time()
-                logger.info(f"File move took {move_end - move_start:.2f} seconds")
+                if not self.config.get('leave_source_files', False): # If leave_source_files is True, don't move the file
+                    # Check if file still exists before moving
+                    if os.path.exists(jsnl_file):
+                        try:
+                            shutil.move(jsnl_file, processed_path)
+                            logger.info(f"Moved processed file to {processed_path}")
+                        except (shutil.Error, OSError) as e:
+                            logger.warning(f"Could not move file {jsnl_file} to {processed_path}: {str(e)}")
+                    else:
+                        logger.warning(f"File no longer exists, cannot move: {jsnl_file}")
+                    move_end = time.time()
+                    logger.info(f"File move took {move_end - move_start:.2f} seconds")
                 
                 file_end_time = time.time()
                 logger.info(f"Total processing time for file {os.path.basename(jsnl_file)}: {file_end_time - file_start_time:.2f} seconds")
@@ -584,6 +585,9 @@ class JSNLProcessor:
         Args:
             file_path: Path to the file to move
         """
+        if self.config.get('leave_source_files', False): # If leave_source_files is True, don't move the file
+            return
+
         if os.path.dirname(file_path) == self.config['input_dir'] and os.path.exists(file_path):
             processed_path = os.path.join(self.config['processed_dir'], os.path.basename(file_path))
             try:
@@ -669,35 +673,30 @@ class JSNLProcessor:
             others.append(value_item)
             return None
     
-    def process_strand_started(self, message: dict) -> bool:
+    def process_component_started(self, message: dict) -> bool:
         """
-        Process a strand_started message.
+        Process a component_started message.
         
         Args:
-            message: The parsed strand_started message
+            message: The parsed component_started message
             
         Returns:
             bool: True if processing succeeded, False otherwise
         """
         try:
             # Extract required fields
-            strand_id = message.get('strand_id')
             mode = message.get('mode', 'unknown')
             config = message.get('config', {})
             config_path = message.get('config_file_path', '')
-            designator = 'strand_simulation'
+            component = message.get('component', 'unknown')
             tuning_date_range = config.get('tuning_date_range', '')
-
-            live = config.get('live', False)
+            live = message.get('live', False) 
             is_live = live if isinstance(live, bool) else live.lower() == 'true'
+            
+            designator = f'{component}_simulation'
 
             if is_live:
-                designator = 'strand_live'
-
-            # Validate required fields
-            if not strand_id:
-                logger.error("Missing strand_id in strand_started message")
-                return False
+                designator = f'{component}_live'
             
             # Get strategy name from config
             strategy_name = config.get('name', 'Unnamed Strategy')
@@ -710,7 +709,7 @@ class JSNLProcessor:
             config['tuning_date_range'] = tuning_date_range
             config['live'] = is_live
             
-            logger.info(f"Processing strand_started message: {strand_id}, {config}, {strategy_name}")
+            logger.info(f"Processing component_started message: {mode}, {config}, {strategy_name}")
             
             # Store in cache and database
             try:
@@ -722,7 +721,7 @@ class JSNLProcessor:
             return True
             
         except Exception as e:
-            logger.error(f"Error processing strand_started message: {str(e)}")
+            logger.error(f"Error processing component_started message: {str(e)}")
             return False
     
     def process_jsnl_line(self, line: str) -> bool:
@@ -736,8 +735,8 @@ class JSNLProcessor:
             message = json.loads(line)
             message_type = message.get('type')
             
-            if message_type == 'strand_started':
-                return self.process_strand_started(message)
+            if message_type in ['ensemble_started', 'strand_started']:
+                return self.process_component_started(message)
             
         except json.JSONDecodeError:
             logger.error(f"Invalid JSON line: {line}")

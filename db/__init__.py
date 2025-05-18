@@ -624,15 +624,36 @@ class DatabaseHandler:
                     else:
                         raise
                 
-                # Exchange partition with staging table
-                exchange_query = f"""
-                    ALTER TABLE dashboard_equity
-                    EXCHANGE PARTITION {p_name} WITH TABLE {self.temp_equity_table}
-                    WITHOUT VALIDATION
+                # Check if partition has existing data
+                check_data_query = f"""
+                    SELECT COUNT(*) FROM dashboard_equity PARTITION ({p_name})
                 """
-                cursor.execute(exchange_query)
-                self.conn.commit()
-                logger.info(f"Exchanged partition {p_name} with staging table for mode {mode}")
+                cursor.execute(check_data_query)
+                existing_count = cursor.fetchone()[0]
+                
+                if existing_count > 0:
+                    # Partition has existing data, use INSERT ... ON DUPLICATE KEY UPDATE
+                    logger.info(f"Partition {p_name} has {existing_count} existing records, merging data")
+                    merge_query = f"""
+                        INSERT INTO dashboard_equity PARTITION ({p_name})
+                        SELECT * FROM {self.temp_equity_table}
+                        ON DUPLICATE KEY UPDATE
+                        equity = VALUES(equity)
+                    """
+                    cursor.execute(merge_query)
+                    self.conn.commit()
+                    logger.info(f"Successfully merged data into partition {p_name}")
+                else:
+                    # No existing data, safe to use EXCHANGE PARTITION
+                    logger.info(f"Partition {p_name} is empty, using EXCHANGE PARTITION")
+                    exchange_query = f"""
+                        ALTER TABLE dashboard_equity
+                        EXCHANGE PARTITION {p_name} WITH TABLE {self.temp_equity_table}
+                        WITHOUT VALIDATION
+                    """
+                    cursor.execute(exchange_query)
+                    self.conn.commit()
+                    logger.info(f"Exchanged partition {p_name} with staging table for mode {mode}")
                 
             finally:
                 cursor.close()
