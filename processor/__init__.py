@@ -500,6 +500,7 @@ class JSNLProcessor:
         
         for record in equity_records_data:
             try:
+                logger.debug(f"Processing record: {record}")
                 # Validate equity value
                 equity_value = record['value'].get('equity')
                 logger.debug(f"Processing record for mode {record['mode']} with equity value: {equity_value}")
@@ -510,13 +511,14 @@ class JSNLProcessor:
                 
                 mode = record['mode']
                 config = self.mode_cache.get_config(mode)
-                
+
                 if config and config.get('live', False):
                     logger.debug(f"Mode {mode} is live, adding to live records")
                     live_records.append(record)
                 else:
                     logger.debug(f"Mode {mode} is not live, adding to non-live records")
                     non_live_records.append(record)
+
             except Exception as e:
                 logger.error(f"Error processing equity record: {str(e)}")
                 logger.debug(f"Failed record: {record}")
@@ -703,7 +705,6 @@ class JSNLProcessor:
 
             # Add file name and processing timestamp to config
             config['source_file'] = self.current_file
-            config['processed_at'] = datetime.now().isoformat()
             config['config_path'] = config_path
             config['designator'] = designator
             config['tuning_date_range'] = tuning_date_range

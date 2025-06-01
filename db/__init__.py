@@ -538,9 +538,9 @@ class DatabaseHandler:
             logger.error(traceback.format_exc())
 
 
-    def store_trading_instance(self, mode: str, component: str, designator: str, config: dict) -> bool:
+    def store_trading_instance(self, mode: str, component: str, designator: str, config: dict, check_existing: bool = True) -> bool:
         """
-        Store a trading instance in the database if it doesn't exist.
+        Store a trading instance in the database, updating if it exists.
         
         Args:
             mode: The trading mode (primary key)
@@ -552,17 +552,27 @@ class DatabaseHandler:
         """
         try:
             # Check if we've seen this instance before
-            if mode in self.known_instances:
+            if check_existing and mode in self.known_instances:
+                logger.info(f"Store_trading_instance: Skipping known instance: {mode}")
                 return True
             
+            logger.info(f"Store_trading_instance: Storing instance: {mode} {component} {designator}")
+
             # Prepare data JSON if we have config
             data_json = None
             if config:
                 data_json = json.dumps(config)
             
-            # New instance found, add to database
+            # New instance found, add to database or update if exists
             self.execute_write_query_with_retries(
-                "INSERT IGNORE INTO trading_instances (mode, component, designator, data) VALUES (%s, %s, %s, %s)",
+                """
+                INSERT INTO trading_instances (mode, component, designator, data) 
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE 
+                    component = VALUES(component),
+                    designator = VALUES(designator),
+                    data = VALUES(data)
+                """,
                 (mode, component, designator, data_json)
             )
             

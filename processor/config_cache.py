@@ -5,6 +5,8 @@ Mode configuration cache for managing trading mode configurations.
 # pylint: disable=W1203,C0303,C0301,C0304
 
 import logging
+import json
+from datetime import datetime
 from typing import Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,14 @@ class ModeConfigCache:
         # Try to load from database
         config = self.load_from_database(mode)
         if config:
+            # Clear cachedStats if it exists to force a new calculation
+            logger.info(f"Clearing cachedStats for mode: {mode}")
+            if 'cachedStats' in config:
+                del config['cachedStats']
+
+            # Save the config to the database
+            self.update_database(mode, config)
+
             self._cache[mode] = config
             return config
             
@@ -67,9 +77,13 @@ class ModeConfigCache:
             # Extract required fields from config
             component = config.get('designator', 'strand_simulation')
             strand_id = config.get('strand_id', '')
+
+            # Update the processed_at field to the current timestamp
+            logger.info(f"Updating database and resetting processed_at with config for mode: {mode}")
+            config['processed_at'] = datetime.now().isoformat()
             
             # Store in database
-            self.db_handler.store_trading_instance(mode, component, strand_id, config)
+            self.db_handler.store_trading_instance(mode, component, strand_id, config, check_existing=False)
             logger.info(f"Updated database with config for mode: {mode}")
             
         except Exception as e:
@@ -92,7 +106,7 @@ class ModeConfigCache:
             result = self.db_handler.execute_read_fetchone_with_retries(query, (mode,))
             
             if result and result[0]:
-                return result[0]
+                return json.loads(result[0])
                 
             logger.warning(f"No configuration found in database for mode: {mode}")
             return None
