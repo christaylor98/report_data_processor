@@ -994,11 +994,11 @@ def test_store_strand_metadata(test_config):
     """Test storing strand metadata in the database."""
     db_handler = DatabaseHandler(test_config)
     
-    # Create mock cursor and connection
+    # Create mock connection and cursor
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor  # Patch conn.cursor() to return our mock_cursor
     db_handler.conn = mock_conn
-    db_handler.cursor = mock_cursor
     
     # Test data
     strand_id = 'test_strand_1'
@@ -1008,21 +1008,18 @@ def test_store_strand_metadata(test_config):
         'parameters': {'param1': 'value1'}
     }
     name = 'Test Strategy'
+    component = 'strand'
+    designator = 'strand_simulation'
     
     # Test inserting new record
     mock_cursor.fetchone.return_value = None
-    success = db_handler.store_strand_metadata(strand_id, config, name)
+    success = db_handler.store_trading_instance(strand_id, component, designator, config, check_existing=False)
     
     assert success is True
-    assert mock_cursor.execute.call_count == 2  # One SELECT, one INSERT
+    assert mock_cursor.execute.call_count == 1  # Only one INSERT/UPDATE
     
-    # Test updating existing record
-    mock_cursor.reset_mock()
-    mock_cursor.fetchone.return_value = ('test_strand_1',)
-    success = db_handler.store_strand_metadata(strand_id, config, name)
-    
-    assert success is True
-    assert mock_cursor.execute.call_count == 2  # One SELECT, one UPDATE
+    # Test updating existing record (simulate duplicate key)
+    # Not applicable for this method, as it uses ON DUPLICATE KEY UPDATE in a single query
 
 def test_process_strand_started_missing_id(test_config, mock_db_handler):
     """Test processing strand_started message with missing strand_id."""
@@ -1039,21 +1036,21 @@ def test_process_strand_started_missing_id(test_config, mock_db_handler):
     }
     
     # Process message
-    success = processor.process_strand_started(message)
+    success = processor.process_component_started(message)
     
     # Verify processing failed
     assert success is False
     
-    # Verify store_strand_metadata was not called
-    mock_db_handler.store_strand_metadata.assert_not_called()
+    # Verify store_trading_instance was not called
+    mock_db_handler.store_trading_instance.assert_not_called()
 
 def test_process_strand_started_db_error(test_config, mock_db_handler):
     """Test handling database errors when processing strand_started messages."""
     processor = JSNLProcessor(test_config)
     processor.db_handler = mock_db_handler
     
-    # Mock store_strand_metadata to raise an exception
-    mock_db_handler.store_strand_metadata.side_effect = Exception("Database error")
+    # Mock store_trading_instance to raise an exception
+    mock_db_handler.store_trading_instance.side_effect = Exception("Database error")
     
     # Create test message
     message = {
@@ -1066,7 +1063,7 @@ def test_process_strand_started_db_error(test_config, mock_db_handler):
     }
     
     # Process message
-    success = processor.process_strand_started(message)
+    success = processor.process_component_started(message)
     
     # Verify processing failed
     assert success is False
@@ -1230,3 +1227,34 @@ class TestCommandLineOptions:
         
         # Verify that only 2 files were processed
         assert len(generated_files) == 2
+
+def test_process_equity_batches_modes(monkeypatch):
+    """Test DatabaseHandler.process_equity_batches with mixed partition existence."""
+    from db import DatabaseHandler
+    handler = DatabaseHandler(config={})
+    mode_existing = 'mode_existing'
+    mode_new = 'mode_new'
+    records_existing = [
+        {'timestamp': 1.0, 'mode': mode_existing, 'value': {'equity': 100.0}},
+        {'timestamp': 2.0, 'mode': mode_existing, 'value': {'equity': 200.0}},
+    ]
+    records_new = [
+        {'timestamp': 3.0, 'mode': mode_new, 'value': {'equity': 300.0}},
+    ]
+    mode_to_records = {
+        mode_existing: records_existing,
+        mode_new: records_new,
+    }
+    # Patch partition_exists: True for mode_existing, False for mode_new
+    handler.partition_exists = MagicMock(side_effect=lambda mode: mode == mode_existing)
+    handler._store_equity_batch_main = MagicMock()
+    handler._store_equity_batch_temp = MagicMock()
+    handler.ensure_temp_equity_table = MagicMock()
+    handler.merge_staging_equity = MagicMock()
+    
+    handler.process_equity_batches(mode_to_records)
+    
+    handler._store_equity_batch_main.assert_called_once_with(records_existing)
+    handler.ensure_temp_equity_table.assert_called_once()
+    handler._store_equity_batch_temp.assert_called_once_with(records_new)
+    handler.merge_staging_equity.assert_called_once_with(mode_new)

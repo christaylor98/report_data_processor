@@ -40,6 +40,8 @@ class DatabaseHandler:
         self.connect_timeout = 10
         self.read_timeout = 30
         self.write_timeout = 30
+        self.created_partitions = set()  # Track created/known partitions this run
+        self.temp_equity_table_ready = False  # Track if temp table is ready
         
     def init_pool(self) -> None:
         """Initialize the database connection pool."""
@@ -65,28 +67,28 @@ class DatabaseHandler:
 
                 logger.info(f"Database connection: {self.conn}")
 
-            # Test the connection and skip if it already exists
-            if self.temp_conn and self.temp_conn.open:
-                logger.info("Temporary database connection already initialized")
-            else:
-                # Create separate connection for temp table operations
-                self.temp_conn = mariadb.connect(
-                    host=os.getenv('DB_HOST', 'localhost'),
-                    user=os.getenv('DB_USER', 'finance'),
-                    password=os.getenv('DB_PASSWORD', ''),
-                    database=os.getenv('DB_NAME', 'trading'),
-                    pool_name='temp_pool',
-                    pool_size=1,  # Single connection for temp operations
-                    connect_timeout=self.connect_timeout,
-                    read_timeout=self.read_timeout,
-                    write_timeout=self.write_timeout,
-                    autocommit=False
-                )
+            # # Test the connection and skip if it already exists
+            # if self.temp_conn and self.temp_conn.open:
+            #     logger.info("Temporary database connection already initialized")
+            # else:
+            #     # Create separate connection for temp table operations
+            #     self.temp_conn = mariadb.connect(
+            #         host=os.getenv('DB_HOST', 'localhost'),
+            #         user=os.getenv('DB_USER', 'finance'),
+            #         password=os.getenv('DB_PASSWORD', ''),
+            #         database=os.getenv('DB_NAME', 'trading'),
+            #         pool_name='temp_pool',
+            #         pool_size=1,  # Single connection for temp operations
+            #         connect_timeout=self.connect_timeout,
+            #         read_timeout=self.read_timeout,
+            #         write_timeout=self.write_timeout,
+            #         autocommit=False
+            #     )
 
-                logger.info(f"Temporary database connection: {self.temp_conn}")
+            #     logger.info(f"Temporary database connection: {self.temp_conn}")
             
-            # Create temporary equity table if it doesn't exist
-            self._create_temp_equity_table()
+            # # Create temporary equity table if it doesn't exist
+            # self._create_temp_equity_table()
             
         except mariadb.Error as e:
             logger.error(f"Error initializing database pools: {str(e)}")
@@ -94,12 +96,14 @@ class DatabaseHandler:
             
     def _get_cursor(self, use_temp: bool = False):
         """Get a new cursor for database operations."""
+        logger.info(f"Getting cursor: use_temp={use_temp}")
         conn = self.temp_conn if use_temp else self.conn
         if not conn or not conn.open:
             if use_temp:
                 self._init_temp_pool()
             else:
                 self.init_pool()
+            conn = self.temp_conn if use_temp else self.conn
         return conn.cursor()
             
     def _init_temp_pool(self) -> None:
@@ -107,7 +111,7 @@ class DatabaseHandler:
         try:
             self.temp_conn = mariadb.connect(
                 host=os.getenv('DB_HOST', 'localhost'),
-                user=os.getenv('DB_USER', 'root'),
+                user=os.getenv('DB_USER', 'finance'),
                 password=os.getenv('DB_PASSWORD', ''),
                 database=os.getenv('DB_NAME', 'trading'),
                 pool_name='temp_pool',
@@ -689,57 +693,141 @@ class DatabaseHandler:
             logger.error(traceback.format_exc())
             raise
 
-    def ensure_partition_exists(self, mode: str) -> bool:
-        """
-        Ensure that a partition exists for the given mode.
-        
-        Args:
-            mode: The mode identifier
-            
-        Returns:
-            bool: True if partition exists or was created successfully
-        """
-        try:
-            logger.debug(f"Checking partition existence for mode: {mode}")
-            
-            # Get partition name
-            p_name = partition_name(mode)
-            logger.debug(f"Generated partition name: {p_name}")
-            
-            # Check if partition exists
-            check_query = f"""
-                SELECT COUNT(*) 
-                FROM information_schema.partitions 
-                WHERE table_schema = DATABASE()
-                AND table_name = 'dashboard_equity'
-                AND partition_name = '{p_name}'
-            """
-            
-            logger.debug("Executing partition existence check query")
-            result = self.execute_read_fetchone_with_retries(check_query)
-            if result and result[0] > 0:
-                logger.debug(f"Partition {p_name} already exists for mode {mode}")
-                return True
-            
-            logger.debug(f"Partition {p_name} does not exist, creating new partition")
-            
-            # Create partition if it doesn't exist
-            add_partition_query = f"""
-                ALTER TABLE dashboard_equity
-                ADD PARTITION (
-                    PARTITION {p_name} VALUES IN ('{mode}')
-                )
-            """
-            
-            logger.debug("Executing partition creation query")
-            self.execute_write_query_with_retries(add_partition_query)
-            logger.debug(f"Successfully created partition {p_name} for mode {mode}")
+    def partition_exists(self, mode: str) -> bool:
+        """Check if a partition exists for the given mode, using cache and DB if needed."""
+        p_name = partition_name(mode)
+        if p_name in self.created_partitions:
             return True
-            
+        # Query DB to check
+        check_query = f"""
+            SELECT COUNT(*) 
+            FROM information_schema.partitions 
+            WHERE table_schema = DATABASE()
+            AND table_name = 'dashboard_equity'
+            AND partition_name = '{p_name}'
+        """
+        result = self.execute_read_fetchone_with_retries(check_query)
+        if result and result[0] > 0:
+            self.created_partitions.add(p_name)
+            return True
+        return False
+
+    def ensure_temp_equity_table(self) -> None:
+        """Create the staging table for equity records if it doesn't exist (idempotent)."""
+        if self.temp_equity_table_ready:
+            return
+        self.init_temp_conn()
+        try:
+            cursor = self.temp_conn.cursor()
+            cursor.execute(f"DROP TABLE IF EXISTS {self.temp_equity_table}")
+            cursor.execute(f"CREATE TABLE {self.temp_equity_table} LIKE dashboard_equity")
+            cursor.execute(f"ALTER TABLE {self.temp_equity_table} REMOVE PARTITIONING")
+            self.temp_conn.commit()
+            cursor.close()
+            logger.info(f"Created staging equity table: {self.temp_equity_table}")
+            self.temp_equity_table_ready = True
         except Exception as e:
-            logger.error(f"Error ensuring partition exists for mode {mode}: {str(e)}")
-            logger.error(traceback.format_exc())
-            return False
+            logger.error(f"Error creating staging equity table: {str(e)}")
+            raise
+
+    def init_temp_conn(self) -> None:
+        """Initialize the temporary table connection pool on demand."""
+        if self.temp_conn and self.temp_conn.open:
+            logger.info("Temporary database connection already initialized")
+            return
+        try:
+            self.temp_conn = mariadb.connect(
+                host=os.getenv('DB_HOST', 'localhost'),
+                user=os.getenv('DB_USER', 'finance'),
+                password=os.getenv('DB_PASSWORD', ''),
+                database=os.getenv('DB_NAME', 'trading'),
+                pool_name='temp_pool',
+                pool_size=1,
+                connect_timeout=self.connect_timeout,
+                read_timeout=self.read_timeout,
+                write_timeout=self.write_timeout,
+                autocommit=False
+            )
+            logger.info(f"Temporary database connection: {self.temp_conn}")
+        except mariadb.Error as e:
+            logger.error(f"Error initializing temp pool: {str(e)}")
+            raise
+
+    def process_equity_batches(self, mode_to_records: Dict[str, List[Dict[str, Any]]]):
+        """
+        Process all equity records by mode: write to main table if partition exists, otherwise use temp table and merge at end.
+        """
+        modes_to_merge = set()
+        for mode, records in mode_to_records.items():
+            if self.partition_exists(mode):
+                self._store_equity_batch_main(records)
+            else:
+                self.ensure_temp_equity_table()
+                self._store_equity_batch_temp(records)
+                modes_to_merge.add(mode)
+        # Merge at the end for all new modes
+        for mode in modes_to_merge:
+            self.merge_staging_equity(mode)
+        # Reset temp table ready flag for next run
+        self.temp_equity_table_ready = False
+
+    def _store_equity_batch_main(self, records: List[Dict[str, Any]]):
+        """Write a batch of equity records directly to the main table."""
+        if not records:
+            return
+        chunk_size = 1000
+        query = """
+            INSERT INTO dashboard_equity 
+            (time_ns, mode, equity) 
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+            equity = VALUES(equity)
+        """
+        for i in range(0, len(records), chunk_size):
+            chunk = records[i:i+chunk_size]
+            batch_data = [
+                (int(r['timestamp'] * 1e9), r['mode'], r['value'].get('equity', 0.0))
+                for r in chunk
+            ]
+            self.execute_write_batch_query_with_retries(query, batch_data)
+
+    def _store_equity_batch_temp(self, records: List[Dict[str, Any]]):
+        """Write a batch of equity records to the temp table."""
+        if not records:
+            return
+        chunk_size = 1000
+        query = f"""
+            INSERT INTO {self.temp_equity_table}
+            (time_ns, mode, equity) 
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+            equity = VALUES(equity)
+        """
+        for i in range(0, len(records), chunk_size):
+            chunk = records[i:i+chunk_size]
+            batch_data = [
+                (int(r['timestamp'] * 1e9), r['mode'], r['value'].get('equity', 0.0))
+                for r in chunk
+            ]
+            retries = 0
+            max_retries = 3
+            while retries < max_retries:
+                try:
+                    cursor = self._get_cursor(use_temp=True)
+                    try:
+                        cursor.executemany(query, batch_data)
+                        self.temp_conn.commit()
+                        break
+                    finally:
+                        cursor.close()
+                except mariadb.Error as e:
+                    retries += 1
+                    if retries == max_retries:
+                        logger.error(f"Failed to store equity batch in temp after {max_retries} retries: {str(e)}")
+                        raise
+                    logger.warning(f"Retry {retries}/{max_retries} for temp equity batch due to: {str(e)}")
+                    time.sleep(2)
+                    self._handle_connection_error(e, retries, use_temp=True)
 
     def store_live_equity(self, record: Dict[str, Any]) -> None:
         """
@@ -749,11 +837,9 @@ class DatabaseHandler:
             record: Dictionary containing equity record data
         """
         try:
-            # Convert timestamp to nanoseconds
             time_ns = int(record['timestamp'] * 1e9)
             mode = record['mode']
-            
-            # Ensure partition exists
+            # Ensure partition exists (create if needed)
             if not self.ensure_partition_exists(mode):
                 logger.error(f"Cannot store equity record - partition creation failed for mode {mode}")
                 return
@@ -809,7 +895,7 @@ class DatabaseHandler:
             for mode, mode_records in mode_groups.items():
                 logger.debug(f"Processing {len(mode_records)} records for mode {mode}")
                 
-                # Ensure partition exists
+                # Ensure partition exists (create if needed)
                 if not self.ensure_partition_exists(mode):
                     logger.error(f"Cannot store equity records - partition creation failed for mode {mode}")
                     continue
@@ -849,3 +935,36 @@ class DatabaseHandler:
             logger.error(f"Error storing live equity batch: {str(e)}")
             logger.error(traceback.format_exc())
             logger.debug(f"Failed records: {records}")
+
+    def ensure_partition_exists(self, mode: str) -> bool:
+        """
+        Ensure a partition exists for the given mode. Create it if it does not exist.
+        Returns True if the partition exists or was created, False otherwise.
+        """
+        p_name = partition_name(mode)
+        if self.partition_exists(mode):
+            return True
+        # Try to create the partition
+        add_partition_query = f"""
+            ALTER TABLE dashboard_equity
+            ADD PARTITION (
+                PARTITION {p_name} VALUES IN ('{mode}')
+            )
+        """
+        try:
+            cursor = self._get_cursor()
+            cursor.execute(add_partition_query)
+            self.conn.commit()
+            self.created_partitions.add(p_name)
+            logger.info(f"Created partition {p_name} for mode {mode}")
+            return True
+        except mariadb.Error as e:
+            if "Duplicate partition name" in str(e):
+                logger.info(f"Partition {p_name} already exists for mode {mode}")
+                self.created_partitions.add(p_name)
+                return True
+            logger.error(f"Failed to create partition {p_name} for mode {mode}: {str(e)}")
+            return False
+        finally:
+            if 'cursor' in locals():
+                cursor.close()

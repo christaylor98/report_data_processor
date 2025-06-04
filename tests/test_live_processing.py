@@ -178,7 +178,7 @@ class TestLiveDataProcessing(unittest.TestCase):
         }
         logger.info(f"Processing valid message: {message}")
         
-        result = self.processor.process_strand_started(message)
+        result = self.processor.process_component_started(message)
         self.assertTrue(result)
         logger.info("Successfully processed valid message")
         
@@ -196,7 +196,7 @@ class TestLiveDataProcessing(unittest.TestCase):
         }
         logger.info(f"Processing invalid message: {invalid_message}")
         
-        result = self.processor.process_strand_started(invalid_message)
+        result = self.processor.process_component_started(invalid_message)
         self.assertFalse(result)
         logger.info("Successfully handled invalid message")
     
@@ -371,7 +371,7 @@ class TestLiveDataProcessing(unittest.TestCase):
         logger.info(f"Processing message with database error: {message}")
         
         # Process the message
-        result = self.processor.process_strand_started(message)
+        result = self.processor.process_component_started(message)
         logger.info(f"Result: {result}")
         
         # Verify the result is False due to the error

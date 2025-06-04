@@ -29,6 +29,7 @@ import pandas as pd
 
 from db import DatabaseHandler
 from .config_cache import ModeConfigCache
+from .file_lock import FileLock
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,8 @@ class JSNLProcessor:
         # Find all JSNL files in the input directory
         file_search_start = time.time()
         jsnl_files = glob.glob(os.path.join(self.config['input_dir'], '*.jsnl'))
+        # Filter out files with 'current' in the filename
+        jsnl_files = [f for f in jsnl_files if 'current' not in os.path.basename(f)]
         file_search_end = time.time()
         logger.info(f"File search took {file_search_end - file_search_start:.2f} seconds")
         
@@ -125,12 +128,7 @@ class JSNLProcessor:
             try:
                 logger.info(f"Processing file in order: {os.path.basename(jsnl_file)}")
                 
-                # Check if file still exists before processing
-                if not os.path.exists(jsnl_file):
-                    logger.warning(f"File no longer exists, skipping: {jsnl_file}")
-                    continue
-                    
-                # Process the file
+                # Process the file (locking is handled in process_single_file)
                 process_start = time.time()
                 result = self.process_single_file(jsnl_file)
                 process_end = time.time()
@@ -139,84 +137,80 @@ class JSNLProcessor:
                 if result[0]:  # If a Parquet file was generated
                     generated_files.append(result[0])
                     timestamps.update(result[1])
-                
-                # Move the file to the processed directory
-                move_start = time.time()
-                processed_path = os.path.join(self.config['processed_dir'], os.path.basename(jsnl_file))
-                
-                if not self.config.get('leave_source_files', False): # If leave_source_files is True, don't move the file
-                    # Check if file still exists before moving
-                    if os.path.exists(jsnl_file):
+                    
+                    # Move the file to the processed directory
+                    move_start = time.time()
+                    processed_path = os.path.join(self.config['processed_dir'], os.path.basename(jsnl_file))
+                    
+                    if not self.config.get('leave_source_files', False):
                         try:
                             shutil.move(jsnl_file, processed_path)
                             logger.info(f"Moved processed file to {processed_path}")
                         except (shutil.Error, OSError) as e:
                             logger.warning(f"Could not move file {jsnl_file} to {processed_path}: {str(e)}")
-                    else:
-                        logger.warning(f"File no longer exists, cannot move: {jsnl_file}")
                     move_end = time.time()
                     logger.info(f"File move took {move_end - move_start:.2f} seconds")
                 
-                file_end_time = time.time()
-                logger.info(f"Total processing time for file {os.path.basename(jsnl_file)}: {file_end_time - file_start_time:.2f} seconds")
-                    
             except Exception as e:
                 logger.error(f"Error processing file {jsnl_file}: {str(e)}")
                 logger.error(traceback.format_exc())
-        
-        # If we have timestamps, log the range
-        if timestamps:
-            min_ts = min(timestamps)
-            max_ts = max(timestamps)
-            min_dt = datetime.fromtimestamp(min_ts)
-            max_dt = datetime.fromtimestamp(max_ts)
-            logger.info(f"Data timestamps range from {min_dt} to {max_dt}")
-        
-        # Create weekly Parquet files from temp files
-        logger.info("Creating weekly Parquet files")
-        weekly_start = time.time()
-        if timestamps:
-            self.create_weekly_files(min_ts, max_ts)
-        weekly_end = time.time()
-        logger.info(f"Weekly file creation took {weekly_end - weekly_start:.2f} seconds")
+                continue
+            
+            file_end_time = time.time()
+            logger.info(f"Total file processing time: {file_end_time - file_start_time:.2f} seconds")
         
         end_time = time.time()
         logger.info(f"Total processing time: {end_time - start_time:.2f} seconds")
+        logger.info(f"Generated {len(generated_files)} Parquet files")
         
         return generated_files
     
     def process_single_file(self, file_path: str) -> Tuple[Optional[str], Set[float]]:
         """
-        Process a single JSNL file and convert it to Parquet format.
+        Process a single JSNL file.
         
         Args:
             file_path: Path to the JSNL file
             
         Returns:
-            Tuple of (generated Parquet file path, set of timestamps)
+            Tuple of (output file path, set of timestamps)
         """
-        logger.info(f"Processing file {file_path}")
+        # Initialize file lock
+        file_lock = FileLock(os.path.join(self.config['temp_dir'], 'locks'))
         
-        # Set current file being processed
-        self.current_file = file_path
-        
-        # Reset tracking dictionaries for new file
-        self.last_equity_values = {}
-        
-        # Validate file and get output path
-        output_file = self._setup_file_processing(file_path)
-        if not output_file:
-            return None, set()
-        
-        # Process the file and collect records
-        records, timestamps, _ = self._process_file_contents(file_path)
-        
-        # If we have valid records, save to Parquet
-        if records:
-            return self._save_and_cleanup(file_path, output_file, records, timestamps)
-        else:
-            logger.warning(f"No valid records found in {file_path}, no Parquet file created")
-            return None, set()
+        # Try to acquire lock
+        with file_lock.acquire_lock(file_path) as lock_fd:
+            if lock_fd is None:
+                logger.warning(f"Could not acquire lock for {file_path}, skipping")
+                return None, set()
+            
+            try:
+                # Check if file still exists
+                if not os.path.exists(file_path):
+                    logger.warning(f"File no longer exists: {file_path}")
+                    return None, set()
+                
+                # Generate file ID
+                file_id = self.get_file_id(file_path)
+                
+                # Set up file processing
+                output_file = self._setup_file_processing(file_path)
+                if not output_file:
+                    return None, set()
+                
+                # Process file contents
+                records, timestamps, stats = self._process_file_contents(file_path)
+                
+                # Write records to Parquet file
+                if records:
+                    self._save_and_cleanup(file_path, output_file, records, timestamps)
+                
+                return output_file, timestamps
+                
+            except Exception as e:
+                logger.error(f"Error processing file {file_path}: {str(e)}")
+                logger.error(traceback.format_exc())
+                return None, set()
     
     def _setup_file_processing(self, file_path: str) -> Optional[str]:
         """
@@ -936,12 +930,25 @@ class JSNLProcessor:
             generated_files = self.process_jsnl_files()
             logger.info(f"Generated {len(generated_files)} Parquet files")
             
-            # # Merge all equity records into the main table
-            # logger.info("Merging equity records into main table")
-            # merge_start = time.time()
-            # self.db_handler.merge_temp_equity_records()
-            # merge_end = time.time()
-            # logger.info(f"Equity records merge took {merge_end - merge_start:.2f} seconds")
+            # Get min and max timestamps from generated files
+            min_timestamp = float('inf')
+            max_timestamp = float('-inf')
+            
+            for file in generated_files:
+                try:
+                    table = pq.read_table(file, columns=['timestamp'])
+                    df = table.to_pandas()
+                    if not df.empty:
+                        min_timestamp = min(min_timestamp, df['timestamp'].min())
+                        max_timestamp = max(max_timestamp, df['timestamp'].max())
+                except Exception as e:
+                    logger.error(f"Error reading timestamps from {file}: {str(e)}")
+            
+            if min_timestamp != float('inf') and max_timestamp != float('-inf'):
+                logger.info(f"Creating weekly files for timestamp range: {min_timestamp} to {max_timestamp}")
+                self.create_weekly_files(min_timestamp, max_timestamp)
+            else:
+                logger.info("No timestamp range found in generated files, skipping weekly file creation")
             
             # Clean up old temp files
             self.cleanup_old_temp_files()

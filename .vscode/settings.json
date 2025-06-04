@@ -4,6 +4,7 @@
         "dbuser",
         "Inno",
         "levelname",
+        "mypool",
         "pyarrow",
         "pythonpath",
         "varchar"
